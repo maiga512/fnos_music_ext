@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import socket
 import threading
 import time
@@ -183,3 +185,165 @@ def test_host_file_only_post_intercepted(tmp_path: Path):
     upstream.shutdown()
     # 上游原样回显请求路径（未拦截）
     assert b"/app/fnmusic-ext/api/host-file" in data
+
+
+# ------------------------------------------------ 导入歌单端点（宿主侧本地处理）
+def _short_dir(name: str) -> Path:
+    """AF_UNIX 路径上限 104 字节，pytest 的 tmp_path 在 macOS 上太长，另开短目录。"""
+    base = Path("/tmp") / f"fmimp_{name}_{os.getpid()}"
+    shutil.rmtree(base, ignore_errors=True)
+    (base / "fnmusic-data" / "imported_playlists").mkdir(parents=True)
+    return base
+
+
+def _imp_env(tmp_path: Path, monkeypatch, name: str = "base") -> "tuple[Path, Path]":
+    """把网关指向临时应用目录：数据根从该目录的 .env 读，和宿主代理一致。
+
+    返回 (应用目录, 数据目录)。socket 另用短路径目录（第三个返回值由调用方取）。
+    """
+    base = _short_dir(name)
+    data_dir = base / "fnmusic-data" / "imported_playlists"
+    (base / ".env").write_text(
+        "FNMUSIC_HOME='%s'\nFNMUSIC_IMPORT_PLAYLISTS_DIR='%s'\n" % (base / "fnmusic-data", data_dir),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_MOD, "_BASE_DIR", base)
+    _MOD.plimp.set_dir(str(data_dir))
+    return base, data_dir
+
+
+def _imp_request(path: str, method: str = "GET", body: dict | None = None,
+                 is_admin: str = "true") -> bytes:
+    payload = json.dumps(body or {}).encode()
+    head = (
+        f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+        f"X-Trim-Isadmin: {is_admin}\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+    ).encode()
+    return head + payload
+
+
+def _payload(data: bytes) -> dict:
+    _head, _, body = data.partition(b"\r\n\r\n")
+    return json.loads(body.decode())
+
+
+def test_import_store_dir_reads_env_data_root(tmp_path: Path, monkeypatch):
+    _base, data_dir = _imp_env(tmp_path, monkeypatch, "dir")
+    assert _MOD.import_store_dir() == str(data_dir)
+
+
+def test_import_routes_are_recognized():
+    ok = {
+        b"GET /app/fnmusic-ext/api/playlists/imported HTTP/1.1": {"action": "list"},
+        b"GET /api/playlists/imported?x=1 HTTP/1.1": {"action": "list"},
+        b"POST /app/fnmusic-ext/api/playlists/import HTTP/1.1": {"action": "import"},
+        b"POST /app/fnmusic-ext/api/playlists/imported/refresh HTTP/1.1": {"action": "refresh"},
+        b"POST /app/fnmusic-ext/api/playlists/imported/delete HTTP/1.1": {"action": "delete"},
+    }
+    for head, expected in ok.items():
+        assert _MOD._import_route(head + b"\r\n\r\n") == expected, head
+    # 其余一律原样转发（不能把 WebUI 自己的接口吃掉）
+    for head in (b"GET /app/fnmusic-ext/api/config HTTP/1.1",
+                 b"GET /app/fnmusic-ext/api/playlists/other HTTP/1.1",
+                 b"DELETE /app/fnmusic-ext/api/playlists/imported/x HTTP/1.1",
+                 b"POST /app/fnmusic-ext/api/playlists/imported/unknown HTTP/1.1"):
+        assert _MOD._import_route(head + b"\r\n\r\n") is None, head
+
+
+def test_import_list_served_on_host_without_upstream(tmp_path: Path, monkeypatch):
+    """列表/删除都由网关直接读写数据根：上游即便在也不该收到这些请求。"""
+    _base, data_dir = _imp_env(tmp_path, monkeypatch, "list")
+    sock_dir = _short_dir("listsock")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(sock_dir, port)
+
+    record = _MOD.plimp.write_record({
+        "id": "imp001", "name": "老歌收藏", "cover": "http://img/c.jpg",
+        "origin": "link", "origin_id": "123", "platform": "tx",
+        "songs": [{"source": "tx", "id": "A1", "name": "晴天", "singer": "周杰伦"}],
+    })
+    assert (data_dir / f"{record['id']}.json").is_file()
+
+    data = _request(sock_path, _imp_request("/app/fnmusic-ext/api/playlists/imported"))
+    payload = _payload(data)
+    assert payload["ok"] is True
+    assert payload["data"][0]["name"] == "老歌收藏"
+    assert payload["data"][0]["count"] == 1
+    assert payload["data"][0]["refreshable"] is True
+
+    data = _request(sock_path, _imp_request("/app/fnmusic-ext/api/playlists/imported/delete",
+                                           "POST", {"id": "imp001"}))
+    assert _payload(data)["ok"] is True
+    assert not (data_dir / "imp001.json").exists()
+    assert _payload(_request(sock_path, _imp_request(
+        "/app/fnmusic-ext/api/playlists/imported")))["data"] == []
+    # 上游回显里不含这些路径 = 一次都没转发
+    echoed = _request(sock_path, b"GET /app/fnmusic-ext/api/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"/app/fnmusic-ext/api/status" in echoed
+    upstream.shutdown()
+
+
+def test_import_endpoints_require_admin(tmp_path: Path, monkeypatch):
+    _base, _data = _imp_env(tmp_path, monkeypatch, "admin")
+    sock_dir = _short_dir("adminsock")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(sock_dir, port)
+    for method, path, body in (
+        ("GET", "/app/fnmusic-ext/api/playlists/imported", None),
+        ("POST", "/app/fnmusic-ext/api/playlists/import", {"text": "x"}),
+    ):
+        data = _request(sock_path, _imp_request(path, method, body, is_admin="false"))
+        assert b"403" in data.split(b"\r\n", 1)[0], path
+        assert _payload(data)["ok"] is False
+    upstream.shutdown()
+
+
+def test_import_validates_body_and_id(tmp_path: Path, monkeypatch):
+    _base, _data = _imp_env(tmp_path, monkeypatch, "bad")
+    sock_dir = _short_dir("badsock")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(sock_dir, port)
+
+    raw = (b"POST /app/fnmusic-ext/api/playlists/imported/delete HTTP/1.1\r\n"
+           b"Host: x\r\nX-Trim-Isadmin: true\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnot")
+    assert _payload(_request(sock_path, raw))["ok"] is False
+    assert b"400" in _request(sock_path, _imp_request(
+        "/app/fnmusic-ext/api/playlists/imported/delete", "POST", {})).split(b"\r\n", 1)[0]
+    assert b"404" in _request(sock_path, _imp_request(
+        "/app/fnmusic-ext/api/playlists/imported/delete", "POST", {"id": "ghost"})).split(b"\r\n", 1)[0]
+    upstream.shutdown()
+
+
+def test_import_text_imports_and_refreshes(tmp_path: Path, monkeypatch):
+    """走一次真实解析链：洛雪 JSON 文本 → 落盘 → 刷新（链接型）。"""
+    _base, _data = _imp_env(tmp_path, monkeypatch, "text")
+    sock_dir = _short_dir("textsock")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(sock_dir, port)
+
+    lx_json = json.dumps({"playList_v2": [{
+        "name": "深夜电台", "id": "lx99",
+        "list": [{"songmid": "S1", "name": "Night", "singer": "DJ",
+                  "interval": 200, "source": "tx"}],
+    }]}, ensure_ascii=False).encode()
+    body = json.dumps({"text": lx_json.decode()}).encode()
+    raw = (
+        "POST /app/fnmusic-ext/api/playlists/import HTTP/1.1\r\n"
+        "Host: x\r\nX-Trim-Isadmin: true\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)
+    ).encode() + body
+    data = _request(sock_path, raw, timeout=20)
+    payload = _payload(data)
+    assert payload["ok"] is True, data[:400]
+    assert payload["data"][0]["name"] == "深夜电台"
+    assert payload["data"][0]["count"] == 1
+    assert payload["data"][0]["refreshable"] is False   # JSON 导入无上游可刷
+    upstream.shutdown()

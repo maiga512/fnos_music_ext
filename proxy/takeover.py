@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TOP[top.takeover] Socket 接管守护：抢官方 socket、故障回滚、子进程管理（fail-closed）
 """Linux-only, fail-closed socket takeover. No business response is an identity."""
 import argparse
 import contextlib
@@ -506,6 +507,7 @@ def diagnostic(text):
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
 _SAFE_OUTCOME = re.compile(
     r'(?:\[dl-capture\] [ -~]{0,600}|'
+    r'\[wan-direct\] [ -~]{0,200}|'
     r'audio decode check failed for [!-~]{1,120} \(ext=[a-z0-9]{1,8} bytes=[0-9]{1,12}\)|'
     r'retrying [!-~]{1,120} with mp3 tier after corrupt lossless stream|'
     r'tee finalize rejected corrupt lossless for [!-~]{1,120}|'
@@ -670,7 +672,32 @@ def supervise(state, base):
             # state instead of racing systemd's own timeout.
             wait_ready(state, 55)
             print('[takeover] proxy identity and readiness verified', flush=True)
-            code = child.wait()
+            # 飞牛音乐服务重启会重新绑定 target socket，抢走我们的接管入口。
+            # 进程还活着但已经收不到流量；发现连续两次不是 proxy 就让 systemd
+            # 按 Restart=on-failure 重启本单元，重新 publish 接管。
+            misses = 0
+            while child.poll() is None:
+                time.sleep(2.0)
+                try:
+                    live = snapshot(state.target)
+                    if live.get('kind') == 'proxy':
+                        misses = 0
+                    else:
+                        misses += 1
+                        if misses >= 2:
+                            raise Unsafe(
+                                'target socket reclaimed by '
+                                + str(live.get('kind') or 'unknown')
+                                + '; restarting takeover'
+                            )
+                except Unsafe:
+                    raise
+                except Exception:
+                    # 瞬时探测失败不直接判死，连续失败由下一轮累计。
+                    misses += 1
+                    if misses >= 4:
+                        raise Unsafe('target socket liveness unavailable; restarting takeover')
+            code = child.poll()
             failure = Unsafe(f'proxy exited (status {code})')
         except InterruptedError as exc:
             if not stopping:

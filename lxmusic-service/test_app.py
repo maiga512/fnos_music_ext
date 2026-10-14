@@ -132,17 +132,16 @@ def test_capabilities_declared_platforms_only(isolated):
         assert caps[src]["reason"] == "platform_not_supported"
 
 
-def test_capabilities_circuit_open(isolated):
+def test_capabilities_circuit_no_longer_blocks_playback(isolated):
     isolated._runtime = FakeRuntime()  # 默认声明 kw
-    # 刚打开（距 open 不到 30s 试探窗口）：已声明平台被拦截
+    # 旧熔断状态仍然记录，但不再拦截播放：否则连续失败会锁死整张歌单。
     lxapp._CHAIN_HEALTH["user_source"] = {
         "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 5, "breaks": 1,
     }
     caps = lxapp.source_capabilities()
-    # 已声明平台被熔断拦截；未声明平台仍报 platform_not_supported
-    assert caps["kw"]["reason"] == "source_circuit_open"
-    assert caps["kw"]["playback_available"] is False
-    assert caps["kw"]["search_available"] is False
+    assert caps["kw"]["reason"] == ""
+    assert caps["kw"]["playback_available"] is True
+    assert caps["kw"]["search_available"] is True
     assert caps["kg"]["reason"] == "platform_not_supported"
 
 
@@ -448,7 +447,7 @@ def test_circuit_opens_after_consecutive_failures(isolated):
     import asyncio
 
     asyncio.run(run())
-    assert len(rt.calls) == 3  # 第 4、5 次被熔断跳过
+    assert len(rt.calls) == 5  # 不再熔断跳过，每首歌独立尝试
     snap = lxapp.chain_health_snapshot()
     assert snap["user_source"]["open"] is True
     assert snap["user_source"]["breaks"] == 1
@@ -639,11 +638,42 @@ def test_track_lyric_tx_base64_decode():
         assert text.endswith("故事的小黄花:")  # &#58; → :
 
 
-def test_track_lyric_kw_returns_empty():
+def test_track_lyric_kw_returns_standard_lrc():
+    """酷我歌词不再是恒空的桩：songinfoandlrc 一枪出词并拼成标准 LRC。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "songinfoandlrc" in str(request.url):
+            assert request.url.params.get("musicId") == "228908"
+            return httpx.Response(200, json={
+                "msg": "ok",
+                "data": {
+                    "songinfo": {"songName": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                                 "pic": "http://img.test/qt.jpg"},
+                    "lrclist": [{"lineLyric": "故事的小黄花", "time": "17.5"}],
+                },
+            })
+        return httpx.Response(404)
+
+    lxapp.app.state.http = mock_client(handler)
     with TestClient(lxapp.app) as client:
         resp = client.get("/api/v1/track/lyric", params={"id": "lx:kw:228908"})
-        assert resp.status_code == 200
-        assert resp.json()["data"]["lyric"] == ""
+    assert resp.status_code == 200
+    lyric = resp.json()["data"]["lyric"]
+    assert lyric.startswith("[ti:晴天]\n[ar:周杰伦]\n[al:叶惠美]")
+    assert "[00:17.50]故事的小黄花" in lyric
+
+
+def test_track_lyric_kw_silent_when_song_has_no_lyric():
+    """上游只回空载荷（无货/抖动耗尽重试）时回空串，不抛错、不影响播放。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"msg": "音乐查询失败", "data": {}})
+
+    lxapp.app.state.http = mock_client(handler)
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/track/lyric", params={"id": "lx:kw:111111"})
+    assert resp.status_code == 200
+    assert resp.json()["data"]["lyric"] == ""
 
 
 # ------------------------------------------------------------------ 榜单推荐 ---
@@ -951,4 +981,3 @@ def test_search_probe_disabled_returns_unverified_without_probing(isolated, monk
             await client.aclose()
 
     asyncio.run(scenario())
-

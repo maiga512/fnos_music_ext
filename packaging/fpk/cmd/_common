@@ -102,9 +102,11 @@ fnmusic_cleanup_sources_container() {
 
 fnmusic_env_source() {
     # 0 when the selected audio source recorded in .env matches $1.
+    # .env 的值带单/双引号（install.sh 与 WebUI 都写 KEY='true'），必须兼容引号，
+    # 否则升级回调读不到已选音源、一律回退默认 musicdl，把用户音源重置掉。
     [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
     local key="$1"
-    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+    grep -qE "^${key}=[\"']?true[\"']?\$" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
 }
 
 fnmusic_saved_source() {
@@ -115,9 +117,45 @@ fnmusic_saved_source() {
     else echo ""; fi
 }
 
+fnmusic_latest_backup_archive() {
+    # 测试/特殊部署可通过 FNMUSIC_BACKUP_VOLUME 指定备份卷；生产默认从
+    # 当前 repo 所在卷根寻找卸载归档。
+    local vol best="" f
+    vol="${FNMUSIC_BACKUP_VOLUME:-}"
+    if [ -z "${vol}" ] && [ -n "${FNMUSIC_REPO_DIR}" ]; then
+        vol="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9][0-9]*/\).*#\1#p')"
+    fi
+    [ -n "${vol}" ] || return 0
+    case "${vol}" in */) ;; *) vol="${vol}/" ;; esac
+    for f in "${vol}"fnmusic-ext-backup-*.tar.gz; do
+        [ -f "${f}" ] || continue
+        if [ -z "${best}" ] || [ "${f}" -nt "${best}" ]; then
+            best="${f}"
+        fi
+    done
+    [ -n "${best}" ] && printf '%s\n' "${best}"
+}
+
+fnmusic_delete_backup_archives() {
+    # 卸载「清空数据」模式：删除所在卷上全部卸载备份归档，不留任何数据痕迹。
+    # 卷解析与 fnmusic_latest_backup_archive 保持一致；FNMUSIC_BACKUP_VOLUME 供测试注入。
+    local vol f
+    vol="${FNMUSIC_BACKUP_VOLUME:-}"
+    if [ -z "${vol}" ] && [ -n "${FNMUSIC_REPO_DIR}" ]; then
+        vol="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9][0-9]*/\).*#\1#p')"
+    fi
+    [ -n "${vol}" ] || return 0
+    case "${vol}" in */) ;; *) vol="${vol}/" ;; esac
+    for f in "${vol}"fnmusic-ext-backup-*.tar.gz; do
+        [ -e "${f}" ] || continue
+        rm -f "${f}"
+    done
+}
+
 fnmusic_saved_lx_url() {
     [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
-    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+    # .env 值带引号（LX_SOURCE_URL='file://...'），去掉首尾引号再返回
+    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1 | sed -e "s/^['\"]//" -e "s/['\"]\$//"
 }
 
 fnmusic_data_items() {

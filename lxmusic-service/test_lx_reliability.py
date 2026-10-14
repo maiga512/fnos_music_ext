@@ -90,12 +90,66 @@ def test_failed_upgrade_tier_not_cached_as_exhausted(isolated):
 
     result = asyncio.run(run())
     assert result is not None
-    # mp3 探活无码率信息：actual_tier 未知（低于任何具名档），降档链继续走完
+    # mp3 探活无码率信息：actual_tier 未知（低于任何具名档）
     assert result["actual_tier"] == "unknown"
-    assert result["attempted_tiers"] == ["high", "standard"]  # lossless 未被记为已尝试
+    # fast_start 默认开：首枪 lossless 报基础设施错→不记为已试；第二枪 high 命中即停，
+    # 不再多花一次 standard 请求（单首要曲最多 2 次脚本调用）。
+    assert result["attempted_tiers"] == ["high"]
+    assert len(rt.calls) == 2  # flac + 320k，刚好用满额度
     # 缓存语义：lossless 请求不能复用（档次不足且未完成降档记录）
     cached = lxapp._cache_get("lx:kw:228908")
     assert lxapp._fresh_probe(cached, "lossless") is None
+
+
+def test_fast_start_shoots_requested_anchor_tier(isolated):
+    """fast_start 首枪必须打「请求锚点」档：要 lossless 先 flac、要 high 先 320k、
+    要 standard 先 128k。以前首枪固定升序先打 128k，proxy 侧的音质偏好到这里就没了。"""
+    cases = (("lossless", "flac", "900001"), ("high", "320k", "900002"),
+             ("standard", "128k", "900003"))
+    seen: dict[str, list[str]] = {}
+
+    for want, expect, item_id in cases:
+        rt = FakeRuntime(platforms={"kw": ["128k", "320k", "flac"]})
+        isolated._runtime = rt
+
+        async def run(item_id: str = item_id):
+            http = mock_client(_media_handler())
+            try:
+                return await lxapp.resolve_and_probe(
+                    http, "kw", dict(_ITEM, id=f"lx:kw:{item_id}"), want)
+            finally:
+                await http.aclose()
+
+        assert asyncio.run(run()) is not None
+        seen[want] = [c["quality"] for c in rt.calls]
+
+    assert seen == {"lossless": ["flac"], "high": ["320k"], "standard": ["128k"]}
+
+
+def test_full_downgrade_walk_when_fast_start_off(isolated, monkeypatch):
+    """关掉 fast_start：从锚点逐档降到最低档，降完才返回（旧的完整降档语义）。"""
+    monkeypatch.setitem(lxapp.CONF, "fast_start", False)
+
+    def resolver(info, quality, platform):
+        if quality == "flac":
+            raise SourceError("resolve", "flac unavailable")
+        return "https://media.test/320.mp3"
+
+    isolated._runtime = FakeRuntime(platforms={"kw": ["128k", "320k", "flac"]},
+                                   resolver=resolver)
+
+    async def run():
+        http = mock_client(_media_handler(ext="mp3", total=9000000))
+        try:
+            return await lxapp.resolve_and_probe(http, "kw", dict(_ITEM), "lossless")
+        finally:
+            await http.aclose()
+
+    result = asyncio.run(run())
+    assert result is not None
+    # lossless 因基础设施失败不记为已试；high 命中后因 actual_tier 未知
+    # （不能证明比当前档更好）仍继续试完 standard
+    assert result["attempted_tiers"] == ["high", "standard"]
 
 
 def test_half_open_failure_reopens(isolated):

@@ -1,3 +1,4 @@
+# TOP[top.nm] 网易账号歌单只读注入（虚拟歌单，不回写网易）
 """网易账号歌单：音乐页注入网易自建歌单（只读虚拟歌单，FNMUSIC_NETEASE_MY_PLAYLISTS）。
 
 链路：playlist/list 注入摘要卡片（内存 5 分钟 / 失败冷却 2 分钟，musicbox 不可用

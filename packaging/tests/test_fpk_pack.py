@@ -90,15 +90,17 @@ class TestUiConfig:
     def test_entry(self, stage: Path):
         cfg = json.loads((stage / "app" / "ui" / "config").read_text())
         entry = cfg[".url"][ENTRY_ID]
+        repo_version = (REPO_ROOT / "VERSION").read_text().strip()
         assert entry["type"] == "iframe"
         # 空端口 + 网关路径：桌面是 HTTPS，不能把管理页嵌成 http://主机:8774
         assert entry["port"] == ""
         assert entry["protocol"] == "http"
-        assert entry["url"] == "/app/fnmusic-ext/"
+        assert entry["url"] == f"/app/fnmusic-ext/?v={repo_version}"
         assert entry["gatewayPrefix"] == "/app/fnmusic-ext"
         assert entry["gatewaySocket"] == "fnmusic-ext.sock"
         assert entry["allUsers"] is False
         assert entry["icon"] == "images/icon_{0}.png"
+        assert "@VERSION@" not in json.dumps(cfg)
         # fnpack 强制入口名以应用名开头（实测规则）
         assert ENTRY_ID.startswith(APPNAME + ".")
 
@@ -129,7 +131,7 @@ class TestWizard:
 
     def test_fnpack_quirks(self, stage: Path):
         """fnpack 实测逆向出的两条硬规则（布尔 initValue / tips 用 text 会打包失败）。"""
-        for name in ("install",):
+        for name in ("install", "uninstall"):
             steps = json.loads((stage / "wizard" / name).read_text())
             for step in steps:
                 for it in step["items"]:
@@ -142,13 +144,21 @@ class TestWizard:
                             f"wizard/{name}: tips 必须用 helpText 而不是 text"
                         )
 
-    def test_no_uninstall_wizard(self, stage: Path):
-        """CLI 卸载会被带输入项的 uninstall 向导阻塞（实测），向导目录只允许 install。"""
+    def test_uninstall_wizard(self, stage: Path):
+        """应用中心卸载弹窗：radio 字段 wizard_keep_data，默认保留（initValue 字符串 "true"）。"""
         names = {p.name for p in (stage / "wizard").iterdir() if p.is_file()}
-        assert names == {"install"}, f"wizard/ 只应包含 install，实际: {names}"
+        assert names == {"install", "uninstall"}, f"wizard/ 应包含 install 与 uninstall，实际: {names}"
+        steps = json.loads((stage / "wizard" / "uninstall").read_text())
+        items = steps[0]["items"]
+        radio = next(it for it in items if it["type"] == "radio")
+        assert radio["field"] == "wizard_keep_data"
+        assert {opt["value"] for opt in radio["options"]} == {"true", "false"}
+        assert radio["initValue"] == "true", "默认必须保留数据，且 initValue 必须是字符串"
+        tips = next(it for it in items if it["type"] == "tips")
+        assert "helpText" in tips and "text" not in tips
 
     def test_field_names_prefixed(self, stage: Path):
-        for name in ("install",):
+        for name in ("install", "uninstall"):
             steps = json.loads((stage / "wizard" / name).read_text())
             for st in steps:
                 for it in st["items"]:

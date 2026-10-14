@@ -300,6 +300,21 @@ async def test_online_info_netease_mapping():
 # 3. resolve_netease_url 降级链 (lossless 404/code!=200 → exhigh 成功；全失败 None)
 # =========================================================================
 @pytest.mark.anyio
+async def test_resolve_netease_url_reuses_url_for_head_get_pair():
+    """同一客户端连续取同一首网易直链只解析一次，覆盖 HEAD+GET 双请求。"""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True, "data": {"code": 200, "url": "http://audio.test/a.mp3"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770") as client:
+        assert await resolve_netease_url(client, "cache-hit-song") == "http://audio.test/a.mp3"
+        assert await resolve_netease_url(client, "cache-hit-song") == "http://audio.test/a.mp3"
+    assert calls["n"] == 1
+
+
+@pytest.mark.anyio
 async def test_resolve_netease_url_downgrade():
     def downgrade_handler(request: httpx.Request) -> httpx.Response:
         quality = request.url.params.get("quality")

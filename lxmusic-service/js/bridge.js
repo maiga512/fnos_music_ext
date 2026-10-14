@@ -419,6 +419,25 @@ const sandbox = {
   fetch,
   performance,
   crypto: crypto.webcrypto,
+  // CeruMusic 插件包装器（由「插件转换器」生成的脚本）会把自己内部沙箱需要的
+  // Buffer 当参数取用，并在文件末尾 module.exports 出 musicUrl/sources；
+  // 缺这两样会在加载期直接 ReferenceError，整条聚合链路（星海/溯音/念心/长青
+  // 多链路自动回退）在桌面版能跑、在本插件里全灭。module 只给空壳，
+  // 不暴露 require/process，脚本拿不到宿主文件与进程能力。
+  Buffer,
+  module: { exports: {} },
+};
+// CeruMusic 插件包装器要求的宿主 API：request/utils 与官方 lx 同源，
+// NoticeCenter 承接它自己的更新提示（转成 updateAlert，管理页照常显示版本更新）。
+sandbox.cerumusic = {
+  request: lxRequest,
+  utils: lxUtils,
+  NoticeCenter(kind, payload) {
+    if (kind === 'update' && payload && typeof payload === 'object') {
+      sendOut({ type: 'event', name: 'updateAlert', payload });
+    }
+    logEvent('info', ['[bridge] cerumusic.NoticeCenter(' + String(kind) + ')']);
+  },
 };
 sandbox.globalThis = sandbox;
 sandbox.global = sandbox;
@@ -428,6 +447,32 @@ try {
   vm.runInContext(rawScript, sandbox, { filename: 'lx-source-script.js', timeout: 10000 });
 } catch (e) {
   fatal('script load failed: ' + (e && e.stack ? e.stack : e));
+}
+
+// CeruMusic 插件包装器从不调用真正的 globalThis.lx（它给内部插件自建了一个
+// mockLx），所以永远不会自己 send(inited)。这里按它 module.exports 出来的
+// sources 合成 inited，并把后续请求转给它导出的 musicUrl。
+// 仅在「脚本没有注册事件请求处理器」时生效，标准自定义源路径完全不受影响。
+let ceruAdapter = null;
+if (!scriptInited) {
+  const exported = sandbox.module && sandbox.module.exports;
+  const declared = exported && exported.sources;
+  if (exported && typeof exported.musicUrl === 'function' && declared && typeof declared === 'object') {
+    ceruAdapter = exported;
+    scriptInited = true;
+    // 包装器把内部插件的 inited 重组后只留下 name/type/qualitys，actions 被丢掉；
+    // 宿主按 actions 含 musicUrl 判定可用平台，缺了会整源判死。包装器对外只有
+    // musicUrl 这一个能力，缺省就补 musicUrl。
+    const normalized = {};
+    for (const code of Object.keys(declared)) {
+      const src = declared[code];
+      const item = src && typeof src === 'object' ? Object.assign({}, src) : {};
+      if (!Array.isArray(item.actions) || item.actions.length === 0) item.actions = ['musicUrl'];
+      normalized[code] = item;
+    }
+    sendOut({ type: 'event', name: 'inited', payload: { sources: normalized, openDevTools: false } });
+    logEvent('info', ['[bridge] CeruMusic 插件包装器：按 module.exports 合成 inited，平台=' + Object.keys(normalized).join(',')]);
+  }
 }
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -448,13 +493,24 @@ rl.on('line', (line) => {
   }
   if (msg.type !== 'request') return;
   const handler = handlers[EVENT_NAMES.request];
-  if (typeof handler !== 'function') {
+  let invoke;
+  if (typeof handler === 'function') {
+    invoke = () => handler({ source: msg.source, action: msg.action, info: msg.info });
+  } else if (ceruAdapter && typeof ceruAdapter.musicUrl === 'function' && msg.action === 'musicUrl') {
+    const info = msg.info || {};
+    invoke = () => ceruAdapter.musicUrl(msg.source, info.musicInfo, info.type);
+  } else {
     sendOut({ id: msg.id, ok: false, error: 'script did not register a request handler' });
     return;
   }
   Promise.resolve()
-    .then(() => handler({ source: msg.source, action: msg.action, info: msg.info }))
-    .then((result) => sendOut({ id: msg.id, ok: true, result: result === undefined ? null : result }))
+    .then(invoke)
+    .then((result) => {
+      // 少数包装器把直链包在 {url} 里；Python 侧只认 http 开头的字符串
+      let value = result === undefined ? null : result;
+      if (value && typeof value === 'object' && typeof value.url === 'string') value = value.url;
+      sendOut({ id: msg.id, ok: true, result: value });
+    })
     .catch((err) => sendOut({ id: msg.id, ok: false, error: err && err.message ? err.message : String(err) }));
 });
 rl.on('close', () => process.exit(0));

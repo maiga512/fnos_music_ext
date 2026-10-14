@@ -12,7 +12,11 @@ from proxy.app import (
     CONF,
     _COVER_CDN_CACHE,
     _COVER_CDN_TRANSPORT,
+    _LX_FAIL_COOLDOWN,
+    _LX_PLATFORM_COOLDOWN,
+    _LX_PLATFORM_HEALTH,
     _LX_QUALITY_LADDER,
+    _LX_URL_CACHE,
     _NETEASE_QUALITY_LADDER,
     _SEARCH_CACHE,
     _reset_search_cache,
@@ -32,6 +36,19 @@ def _clean_cover_caches():
     _COVER_CDN_CACHE.clear()
     yield
     _COVER_CDN_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_lx_state():
+    """洛雪解析的 URL 缓存 / 失败冷却 / 平台健康是进程级全局，用例间必须隔离，
+    否则上一首要曲的 15s 失败冷却会让下一首直接短路，看不出真实档序。"""
+    for state in (_LX_URL_CACHE, _LX_FAIL_COOLDOWN, _LX_PLATFORM_COOLDOWN,
+                  _LX_PLATFORM_HEALTH):
+        state.clear()
+    yield
+    for state in (_LX_URL_CACHE, _LX_FAIL_COOLDOWN, _LX_PLATFORM_COOLDOWN,
+                  _LX_PLATFORM_HEALTH):
+        state.clear()
 
 
 @pytest.fixture()
@@ -405,7 +422,11 @@ def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
 
     def cdn_handler(request: httpx.Request) -> httpx.Response:
         cdn_calls["n"] += 1
-        assert "rid=123" in str(request.url)
+        url = str(request.url)
+        if "songinfoandlrc" in url:
+            assert "musicId=123" in url
+            return httpx.Response(200, json={"data": {"songinfo": {"pic": ""}}})
+        assert "rid=123" in url
         return httpx.Response(200, text="http://img.kuwo.cn/abc/real.jpg extra")
 
     _setup_clients(lx=lx_handler)
@@ -416,7 +437,7 @@ def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
         assert resp.headers["location"] == "http://img.kuwo.cn/abc/real.jpg"
         # 第二次命中内存缓存，不再打 CDN
         client.get("/music/api/v1/static/cover?coverId=online:lx:kw:123", follow_redirects=False)
-    assert cdn_calls["n"] == 1
+    assert cdn_calls["n"] == 2  # songinfoandlrc 未出图 → artistpicserver 兜底各 1 次
 
 
 def test_cover_qq_albummid_gtimg_redirect(monkeypatch):
@@ -440,6 +461,8 @@ def test_cover_qq_albummid_gtimg_redirect(monkeypatch):
 def test_cover_enrich_via_netease_search(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "online_sources", "KugouMusicClient,QqMusicClient,KuwoMusicClient,MiguMusicClient")
+    # 2.6.36: 网易补全仅在 netease 源启用时走（未启用时 musicbox 不在线，跳过死调用）
+    monkeypatch.setitem(CONF, "netease_enabled", True)
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
@@ -492,7 +515,8 @@ def test_cover_enrich_disabled_falls_to_placeholder(monkeypatch):
         resp = client.get("/music/api/v1/static/cover?coverId=online:kugou:xyz", follow_redirects=False)
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("image/png")
-    assert resp.headers.get("cache-control") == "public, max-age=86400"
+    # 占位图不随图带缓存：同一封面地址后续可能换成真图，缓存会把封面钉死在灰图上
+    assert resp.headers.get("cache-control") == "no-store, no-cache, must-revalidate"
     assert box_calls["n"] == 0  # 补全关闭不打 musicbox
 
 

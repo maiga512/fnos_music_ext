@@ -78,6 +78,13 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 .provider-card input { position: absolute; opacity: 0; }
 .provider-card.selected { border-color: var(--accent); background: var(--accent-soft); }
 .provider-head { font-weight: 600; }
+.version-tag {
+  display: inline-flex; align-items: center; vertical-align: middle;
+  margin-left: 6px; padding: 1px 6px; border-radius: 4px;
+  border: 1px solid #c8d8f7; background: var(--accent-soft);
+  color: var(--accent); font-size: 12px; font-weight: 600; line-height: 1.4;
+}
+.version-tag.muted { border-color: var(--line); background: #f4f6f8; color: var(--muted); font-weight: 500; }
 .provider-desc { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .provider-card.selected .provider-head::after { content: " ✓"; color: var(--accent); }
 
@@ -139,6 +146,38 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .kv b { flex: none; min-width: 84px; color: var(--muted); font-weight: 500; }
 
 /* -------------------------------------------------- 二维码/报告 */
+/* 音源列表：主源与附加源合并后的一行一源 */
+.source-row {
+  display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #fff;
+}
+.source-row.is-off { opacity: .62; }
+.source-row .row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.source-row .row-title { font-weight: 600; overflow-wrap: anywhere; }
+.source-row .row-actions { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.source-row .btn { padding: 5px 11px; font-size: 13px; }
+.source-row .sub { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.badge {
+  display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 4px;
+  border: 1px solid var(--line); background: #f4f6f8; color: var(--muted);
+  font-size: 12px; font-weight: 600; line-height: 1.4;
+}
+.badge.primary { border-color: #c8d8f7; background: var(--accent-soft); color: var(--accent); }
+.badge.off { border-color: var(--line); }
+.divider { height: 1px; background: var(--line); margin: 14px 0; }
+textarea.input { resize: vertical; min-height: 92px; font-family: inherit; line-height: 1.5; }
+
+/* 导入歌单列表 */
+.import-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+}
+.import-row:last-of-type { border-bottom: 0; }
+.import-row .row-title { font-weight: 600; overflow-wrap: anywhere; }
+.import-row .sub { font-size: 13px; color: var(--muted); flex-basis: 100%; }
+.import-row .row-actions { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.import-row .btn { padding: 5px 11px; font-size: 13px; }
+
 .qr-area { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px 0; }
 #qr-img { width: 220px; height: 220px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .report {

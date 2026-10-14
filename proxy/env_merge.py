@@ -1,3 +1,4 @@
+# TOP[top.env.merge] .env 安全合并：保留用户已有值、新键自动补齐（升级幂等）
 """fnmusic-ext .env 安全合并工具（防覆盖 / 平滑升级）.
 
 install.sh 在写入 .env 前先收集“本次安装期望的配置”，再调用本模块与

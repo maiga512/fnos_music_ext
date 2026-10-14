@@ -27,6 +27,7 @@ __pycache__/
 *.part
 *.log
 .DS_Store
+._*
 .git.nested/
 **/.git.nested/
 TASK_*.md

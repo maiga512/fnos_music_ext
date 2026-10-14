@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -604,6 +606,7 @@ class FakeUserSource:
         self.meta = meta
         self.stopped = False
         self.running = True
+        self.update_alert = None
         FakeUserSource.instances.append(self)
 
     async def start(self):
@@ -689,6 +692,54 @@ def test_manager_get_returns_none_after_stop(fake_user_source, tmp_path):
     runtime = mgr.get()
     asyncio.run(mgr.shutdown())
     assert mgr.get() is None
+
+
+def test_multi_source_pool_survives_process_restart(fake_user_source, tmp_path):
+    """附加洛雪源写入 sources.json + 脚本文件，重启后必须恢复。"""
+    first = sr.MultiSourceManager(tmp_path)
+    asyncio.run(first.add("https://src.test/pool.js", script=STUB_SCRIPT, name="池源"))
+    restarted = sr.MultiSourceManager(tmp_path)
+    asyncio.run(restarted.load())
+    items = restarted.describe_all()
+    assert len(items) == 1
+    assert items[0]["name"] == "池源"
+    assert items[0]["url"] == "https://src.test/pool.js"
+    script_files = list((tmp_path / "sources").glob("*.js"))
+    assert len(script_files) == 1
+    assert script_files[0].read_text(encoding="utf-8") == STUB_SCRIPT
+
+
+@pytest.mark.anyio
+async def test_pool_check_update_exposes_current_and_latest_versions(fake_user_source, tmp_path, monkeypatch):
+    mgr = sr.MultiSourceManager(tmp_path)
+    added = await mgr.add("https://src.test/pool.js", script=STUB_SCRIPT, name="池源")
+    latest_script = STUB_SCRIPT.replace("@version 1.0.0", "@version v8.8.0")
+    async def fake_download(_url):
+        return latest_script
+    monkeypatch.setattr(sr, "download_script", fake_download)
+    result = await mgr.check_update(added["id"])
+    assert result["available"] is True
+    assert result["current_version"] == "1.0.0"
+    assert result["latest_version"] == "v8.8.0"
+
+
+@pytest.mark.anyio
+async def test_pool_wait_loaded_publishes_metadata_before_slow_runtime_start(fake_user_source, tmp_path, monkeypatch):
+    seeded = sr.MultiSourceManager(tmp_path)
+    await seeded.add("https://src.test/pool.js", script=STUB_SCRIPT, name="池源")
+    gate = asyncio.Event()
+    class SlowUserSource(fake_user_source):
+        async def start(self):
+            await gate.wait()
+    monkeypatch.setattr(sr, "UserSource", SlowUserSource)
+    mgr = sr.MultiSourceManager(tmp_path)
+    task = asyncio.create_task(mgr.load())
+    assert await mgr.wait_loaded(timeout=0.5) is True
+    assert mgr.describe_all()[0]["name"] == "池源"
+    assert mgr.describe_all()[0]["meta"]["version"] == "1.0.0"
+    assert gate.is_set() is False
+    gate.set()
+    await task
 
 
 def test_manager_state_dir_fallback_when_unwritable(tmp_path):
@@ -865,3 +916,169 @@ def test_reap_orphan_bridges_skips_own_children(tmp_path, monkeypatch):
     monkeypatch.setattr(_os, "kill", lambda pid, sig: (_ for _ in ()).throw(AssertionError("must not kill")))
     monkeypatch.setattr(sr.os, "getpid", lambda: 777)
     assert sr.reap_orphan_bridges(bridge_path=bridge, proc_root=proc) == []
+
+# ------------------------------------------------------------------ Node 解析 ---
+
+def test_resolve_node_bin_respects_explicit_override(monkeypatch):
+    monkeypatch.setenv("LX_NODE_BIN", "/opt/node/bin/node")
+    assert sr._resolve_node_bin() == "/opt/node/bin/node"
+
+
+def test_resolve_node_bin_keeps_elf_default(monkeypatch, tmp_path):
+    elf = tmp_path / "node"
+    elf.write_bytes(b"\x7fELF" + b"fake")
+    elf.chmod(0o755)
+    monkeypatch.delenv("LX_NODE_BIN", raising=False)
+    monkeypatch.setattr(sr.shutil, "which", lambda name: str(elf))
+    assert sr._resolve_node_bin() == "node"
+
+
+def test_resolve_node_bin_skips_python_wrapper(monkeypatch, tmp_path):
+    """nodejs-wheel 式包装：/usr/local/bin/node 是脚本时取 wheel 内 ELF。"""
+    wrapper = tmp_path / "usr-local" / "bin" / "node"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/python3\n# nodejs-wheel shim\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    wheel_bin = tmp_path / "purelib" / "nodejs_wheel" / "bin" / "node"
+    wheel_bin.parent.mkdir(parents=True)
+    wheel_bin.write_bytes(b"\x7fELF" + b"real")
+    wheel_bin.chmod(0o755)
+    monkeypatch.delenv("LX_NODE_BIN", raising=False)
+    monkeypatch.setattr(sr.shutil, "which", lambda name: str(wrapper))
+    monkeypatch.setattr(sr.sysconfig, "get_path", lambda kind: str(tmp_path / "purelib"))
+    assert sr._resolve_node_bin() == str(wheel_bin)
+
+
+def test_resolve_node_bin_falls_back_without_wheel(monkeypatch, tmp_path):
+    wrapper = tmp_path / "node"
+    wrapper.write_text("#!/bin/sh\nexec real-node $@\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.delenv("LX_NODE_BIN", raising=False)
+    monkeypatch.setattr(sr.shutil, "which", lambda name: str(wrapper))
+    monkeypatch.setattr(sr.sysconfig, "get_path", lambda kind: str(tmp_path / "absent"))
+    assert sr._resolve_node_bin() == str(wrapper) or sr._resolve_node_bin() == "node"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group 语义仅 POSIX")
+def test_stop_kills_wrapper_process_group(tmp_path):
+    """wrapper 不转发 SIGTERM 时，stop() 也必须带走整个进程组（含 node 级子进程）。"""
+    async def run():
+        rt = _new_runtime(tmp_path)
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", "sleep 300 & echo $!; wait",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        child_pid = int((await proc.stdout.readline()).strip())
+        rt._proc = proc
+        rt._started = True
+        await rt.stop()
+        return child_pid
+
+    child_pid = asyncio.run(run())
+    time.sleep(0.3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_music_url_lazy_restarts_after_stop(fake_spawn, tmp_path):
+    """空闲回收/轮换后首个请求应懒重建并照常解析（链路不断）。"""
+    async def run():
+        rt = _new_runtime(tmp_path)
+
+        async def feeder():
+            while len(fake_spawn) < 1:
+                await asyncio.sleep(0.001)
+            fake_spawn[0].stdout.feed(_inited_line())
+            while len(fake_spawn) < 2:
+                await asyncio.sleep(0.001)
+            fake_spawn[1].stdout.feed(_inited_line())
+            await _respond(fake_spawn[1], result="https://media.test/a.flac")
+
+        feed_task = asyncio.create_task(feeder())
+        await rt.start()
+        assert rt.running is True
+        await rt.stop()
+        assert rt.running is False
+        url = await rt.music_url({"id": "1"}, "flac", platform="kw", timeout=5.0)
+        await feed_task
+        return url
+
+    assert asyncio.run(run()) == "https://media.test/a.flac"
+
+
+# ------------------------------------------------------------------ 源池去重 ---
+
+def test_pool_add_rejects_duplicate_script(fake_user_source, tmp_path):
+    mgr = sr.MultiSourceManager(tmp_path)
+    asyncio.run(mgr.add("https://src.test/one.js", script=STUB_SCRIPT, name="甲"))
+    with pytest.raises(sr.SourceError) as ei:
+        asyncio.run(mgr.add("https://src.test/other.js", script=STUB_SCRIPT, name="乙"))
+    assert ei.value.category == "duplicate"
+    assert len(mgr.describe_all()) == 1
+
+
+def test_pool_add_allows_different_scripts(fake_user_source, tmp_path):
+    mgr = sr.MultiSourceManager(tmp_path)
+    asyncio.run(mgr.add("https://src.test/one.js", script=STUB_SCRIPT, name="甲"))
+    other = STUB_SCRIPT.replace("@name test-src", "@name another-src")
+    added = asyncio.run(mgr.add("https://src.test/two.js", script=other, name="乙"))
+    assert added["name"] == "乙"
+    assert len(mgr.describe_all()) == 2
+
+
+# ------------------------------------------------------------------ 内存守护 ---
+
+def test_memory_guard_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("LX_SOURCE_IDLE_REAP_S", raising=False)
+    monkeypatch.delenv("LX_SOURCE_MAX_UPTIME_S", raising=False)
+    assert sr.memory_guard_enabled() is False
+
+
+def test_memory_guard_enabled_with_env(monkeypatch):
+    monkeypatch.setenv("LX_SOURCE_IDLE_REAP_S", "600")
+    assert sr.memory_guard_enabled() is True
+
+
+def test_memory_guard_reaps_idle_runtime_only(monkeypatch):
+    monkeypatch.setenv("LX_SOURCE_IDLE_REAP_S", "600")
+    monkeypatch.delenv("LX_SOURCE_MAX_UPTIME_S", raising=False)
+
+    class RT:
+        def __init__(self, name: str, idle_for: float):
+            self.meta = {"name": name}
+            self.script = "stub"
+            self.running = True
+            self.stopped = False
+            self.last_used = time.time() - idle_for
+            self.started_at = time.time() - 3600.0
+
+        async def stop(self):
+            self.stopped = True
+            self.running = False
+
+        async def recycle(self):
+            self.stopped = True
+
+    idle_rt = RT("闲置源", 999.0)
+    active_rt = RT("活跃源", 10.0)
+    runtimes = [idle_rt, active_rt]
+
+    async def run():
+        task = asyncio.create_task(sr.run_memory_guard(lambda: runtimes))
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if idle_rt.stopped:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return idle_rt.stopped, active_rt.stopped
+
+    stopped_idle, stopped_active = asyncio.run(run())
+    assert stopped_idle is True
+    assert stopped_active is False

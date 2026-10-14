@@ -16,3 +16,12 @@ def _no_real_ffmpeg(monkeypatch):
     monkeypatch.setattr(tc, "_SESSIONS", {})
     monkeypatch.setattr(tc, "_ACTIVE", 0)
     monkeypatch.setattr(tc, "_SLOT_COND", None)
+
+
+@pytest.fixture(autouse=True)
+def _no_wan_direct(monkeypatch):
+    # 测试环境统一关闭外网直连CDN：mock 直链若触发真实网络探测会拖慢/拖挂用例。
+    # 直连行为由 test_wan_direct.py 单独覆盖。
+    from proxy.app import CONF as _CONF
+
+    monkeypatch.setitem(_CONF, "wan_direct_enabled", False)

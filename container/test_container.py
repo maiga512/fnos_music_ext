@@ -229,6 +229,8 @@ def test_compose_single_service_layout():
     assert "0.0.0.0:8774" not in raw
     assert "./sources-data:/data" in svc["volumes"]
     assert any(v.startswith(".:/repo") for v in svc["volumes"])
+    assert "./webui-service/static:/srv/webui-service/static:ro" in svc["volumes"]
+    assert svc["environment"]["WEBUI_STATIC_DIR"] == "/repo/webui-service/static"
     assert svc["restart"] == "unless-stopped"
     assert svc["healthcheck"]["test"] == ["CMD", "/usr/local/bin/healthcheck.sh"]
 
@@ -312,7 +314,10 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
-        for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
+        for py in sorted(
+            p for p in (REPO_ROOT / service_dir).glob("*.py")
+            if not p.name.startswith("._")
+        ):
             for m in re.finditer(r"^\s*from proxy\.([A-Za-z_][\w]*)", py.read_text(encoding="utf-8"), re.M):
                 mod = f"proxy/{m.group(1)}.py"
                 assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"

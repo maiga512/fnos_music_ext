@@ -1,3 +1,4 @@
+# TOP[top.musicdl] musicdl：57 平台聚合解析（ID 契约 <source>:<id>）
 """musicdl HTTP 服务：把 musicdl 库包装成共享音源 API.
 
 统一曲目 ID 契约: "<source>:<identifier>"，例如 "kuwo:228908"。

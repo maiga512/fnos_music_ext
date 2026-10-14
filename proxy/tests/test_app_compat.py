@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
 from proxy.app import app, CONF, _SEARCH_CACHE, fake_official_guid
+from proxy import app as appmod
 from proxy.takeover import safe_child_log
 
 
@@ -201,6 +202,54 @@ def test_stream_head_and_path_form_guid():
         assert got.status_code == 200
         assert got.content == audio
         assert len(upstream_calls) == calls_before
+
+
+def test_stream_head_online_open_tuple_is_supported():
+    """未缓存的在线曲目也能先 HEAD；_open_online_stream 的七元组不能被误拆。"""
+    audio = b"FAKE_AUDIO_HEAD_" * 100
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=audio,
+            headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(audio))},
+        )
+
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    with TestClient(app) as client:
+        head = client.head("/music/api/v1/track/stream?guid=online:kuwo:228908")
+    assert head.status_code == 200
+    assert head.headers.get("content-length") == str(len(audio))
+    assert head.content == b""
+
+
+def test_head_then_get_reuses_open_stream(tmp_path, monkeypatch):
+    """HEAD 预热成功的在线流，紧跟 GET 时不再重复连接 CDN。"""
+    audio = b"HEAD_GET_REUSE_AUDIO_" * 80
+    calls = {"n": 0}
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            calls["n"] += 1
+        return httpx.Response(
+            200, content=audio,
+            headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(audio))},
+        )
+
+    monkeypatch.setattr(appmod, "find_cache_file", lambda _guid: None)
+    monkeypatch.setitem(CONF, "tee_save_enabled", False)
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    with TestClient(app) as client:
+        head = client.head("/music/api/v1/track/stream?guid=online:kuwo:head-reuse")
+        got = client.get("/music/api/v1/track/stream?guid=online:kuwo:head-reuse")
+    assert head.status_code == 200
+    assert got.status_code == 200
+    assert got.content == audio
+    assert calls["n"] == 1
 
 
 def test_event_report_captures_payload_metadata():

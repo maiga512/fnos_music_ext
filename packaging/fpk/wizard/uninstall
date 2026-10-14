@@ -1,0 +1,33 @@
+[
+    {
+        "stepTitle": "卸载 fnMusic 音源扩展",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "卸载后会自动还原官方音乐入口。请选择如何处理现有数据（音源设置、登录状态、收藏、播放历史）："
+            },
+            {
+                "type": "radio",
+                "field": "wizard_keep_data",
+                "label": "用户数据处理",
+                "initValue": "true",
+                "options": [
+                    {
+                        "label": "保留设置、音源与登录状态（推荐）— 卸载前完整备份到存储卷根目录（fnmusic-ext-backup-*.tar.gz）；重新安装后自动恢复洛雪附加源、设置（.env）与登录状态，收藏与播放历史也可从备份找回",
+                        "value": "true"
+                    },
+                    {
+                        "label": "清空全部数据 — 不保留任何备份，并删除之前卸载产生的历史备份文件；登录状态、音源、设置、收藏与播放历史全部清除且不可恢复",
+                        "value": "false"
+                    }
+                ],
+                "rules": [
+                    {
+                        "required": true,
+                        "message": "请选择数据处理方式"
+                    }
+                ]
+            }
+        ]
+    }
+]

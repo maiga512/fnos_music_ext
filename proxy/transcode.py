@@ -1,3 +1,4 @@
+# TOP[top.transcode] 标准音质转码：ffmpeg fMP4 HLS 会话与生命周期
 """标准音质转码会话：ffmpeg fMP4 HLS 生产与生命周期。
 
 官方 App 选"标准音质"后不再直拉原文件，改走服务端转码 HLS：
@@ -106,6 +107,7 @@ def _usable_cache(directory: str) -> dict | None:
     state = _read_state(directory)
     if state.get("status") != "done":
         return None
+    # 与官方一致：fMP4 会话必须有 init.mp4 才算完整。
     if not os.path.isfile(os.path.join(directory, INIT_NAME)):
         return None
     return state
@@ -417,7 +419,10 @@ async def wait_file(path: str, sess: Session | None, timeout: float = 30.0) -> s
     """等分片落盘（temp_file 改名后出现即完整）；会话失败立即返回。"""
     deadline = time.monotonic() + timeout
     while True:
-        if os.path.isfile(path):
+        # 必须等文件有实际内容：init.mp4 可能在 ffmpeg 开写瞬间存在但仍是 0 字节
+        # （远程源要先下载才能写 init），0 字节的 init 会被 App 解码器直接拒收
+        # → 跳歌。temp_file 改名后 size>0 才算完整。
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
             return path
         if sess and sess.exit_event.is_set() and sess.status != "done":
             return None

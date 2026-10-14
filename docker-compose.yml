@@ -31,6 +31,10 @@ services:
     volumes:
       - ./sources-data:/data
       - .:/repo
+      # NAS 桌面窗口与网页管理台共用这份静态前端；直接挂载，升级后不必等镜像内旧 UI 更新。
+      - ./webui-service/static:/srv/webui-service/static:ro
+    environment:
+      WEBUI_STATIC_DIR: /repo/webui-service/static
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]

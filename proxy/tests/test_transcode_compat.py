@@ -753,7 +753,7 @@ async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeyp
                 "ext": "mp3" if force_mp3 else "flac"}
         resp = httpx.Response(200, stream=_Whole(data),
                               headers={"content-length": str(len(data))})
-        return (resp, None, info["ext"], info, _Done(), data)
+        return (resp, None, info["ext"], info, _Done(), data, None, None)
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()
@@ -780,7 +780,8 @@ async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monk
         data = b"fLaC" + b"F" * 9000
         resp = httpx.Response(200, stream=_Whole(data),
                               headers={"content-length": str(len(data))})
-        return (resp, None, "flac", {"title": "测试曲2", "artist": "测试人"}, _Done(), data)
+        return (resp, None, "flac", {"title": "测试曲2", "artist": "测试人"}, _Done(), data,
+                None, None)
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()

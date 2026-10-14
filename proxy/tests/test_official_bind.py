@@ -336,7 +336,7 @@ async def test_resume_part_download_appends_and_finalizes(tmp_path, monkeypatch)
     async def fake_open(request, guid, range_header, force_mp3=False):
         calls["range"] = range_header
         return (FakeResp(), None, "mp3", {"title": "晴天", "artist": "周杰伦"},
-                empty_chunks(), tail)
+                empty_chunks(), tail, None, None)
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
 
@@ -372,7 +372,7 @@ async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeyp
             pass
 
     async def fake_open(request, guid, range_header, force_mp3=False):
-        return (FakeResp(), None, "mp3", {}, None, b"")
+        return (FakeResp(), None, "mp3", {}, None, b"", None, None)
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
 

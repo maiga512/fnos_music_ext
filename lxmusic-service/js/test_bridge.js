@@ -12,7 +12,8 @@
  *   - rsaEncrypt 对齐官方 NO_PADDING + 左零填充（网易 weapi 依赖此语义）
  *   - 沙箱 Web API（setInterval/atob/btoa/TextEncoder/crypto.getRandomValues 等）
  *   - 未 inited 前异步崩溃按官方语义报 fatal；inited 后仅记日志
- *   - 沙箱全局白名单（process/require/Buffer 不可见）
+ *   - 沙箱全局白名单（process/require 不可见；Buffer 为 Ceru 插件包装器必需，可见）
+ *   - CeruMusic 插件包装器适配（module.exports 合成 inited + musicUrl 派发）
  *
  * 运行：node lxmusic-service/js/test_bridge.js   （退出码 0=全部通过）
  */
@@ -519,10 +520,73 @@ lx.on(lx.EVENT_NAMES.request, () => {});
       const message = b.logs().find((m) => m.includes('LEAK='));
       assert.ok(message.includes('process=false'), message);
       assert.ok(message.includes('require=false'), message);
-      assert.ok(message.includes('Buffer=false'), message);
+      // Buffer 现在刻意可见：CeruMusic 插件包装器要把 Buffer 当参数传进它
+      // 自建的内部沙箱，缺它整条聚合链路在加载期就 ReferenceError。
+      // Buffer 不含文件/进程能力，require 与 process 仍然不可见。
+      assert.ok(message.includes('Buffer=true'), message);
       assert.ok(message.includes('global=true'), 'global 应指向沙箱自身');
       assert.ok(message.includes('setTimeout=true'), message);
       assert.ok(message.includes('URL=true'), message);
+    },
+  });
+}
+
+async function test_ceru_plugin_wrapper_adapter() {
+  // 「插件转换器」产出的包装器从不碰真正的 globalThis.lx（它给内部插件自建
+  // mockLx），只把 sources/musicUrl 挂在 module.exports 上。桥必须合成 inited
+  // 并把请求转给 musicUrl，否则这类聚合音源（多链路自动回退）整条不可用。
+  const script = `
+const { request, utils } = cerumusic;
+if (typeof request !== 'function') throw new Error('cerumusic.request missing');
+if (!utils || !utils.buffer) throw new Error('cerumusic.utils incomplete');
+const tag = Buffer.from('buf-ok', 'utf8').toString();
+module.exports = {
+  sources: { kw: { name: '酷我音乐', type: 'music', qualitys: ['320k'] } },
+  musicUrl: async (source, musicInfo, quality) => {
+    console.log('CERU_CALL=' + source + '|' + musicInfo.name + '|' + quality + '|' + tag);
+    return { url: 'http://media.test/' + source + '.m4a' };
+  },
+};
+`;
+  await bridgeCase(script, {
+    feed: [JSON.stringify({
+      id: 'c1', type: 'request', source: 'kw', action: 'musicUrl',
+      info: { type: '320k', musicInfo: { name: '小幸运' } },
+    })],
+    waitUntil: (evs) => evs.some((e) => e.id === 'c1'),
+    then: (b) => {
+      const inited = b.events().find((e) => e.type === 'event' && e.name === 'inited');
+      assert.ok(inited, '包装器必须按 module.exports 合成 inited');
+      assert.equal(inited.payload.sources.kw.qualitys.join(','), '320k');
+      // 包装器导出里没有 actions，宿主按 actions 含 musicUrl 判平台，
+      // 缺省不补就会整源判死（NAS 现场：三份全豆要全部加载失败）
+      assert.deepEqual(inited.payload.sources.kw.actions, ['musicUrl']);
+      const reply = b.events().find((e) => e.id === 'c1');
+      assert.equal(reply.ok, true, JSON.stringify(reply));
+      assert.equal(reply.result, 'http://media.test/kw.m4a', '{url} 载荷必须摊平成字符串');
+      assert.ok(
+        b.logs().some((m) => m.includes('CERU_CALL=kw|小幸运|320k|buf-ok')),
+        b.logs().join(' | '),
+      );
+    },
+  });
+}
+
+async function test_ceru_wrapper_notices_reach_update_alert() {
+  // 包装器用自己的 cerumusic.NoticeCenter 报更新，必须转成 updateAlert 事件，
+  // 管理页才看得到「有新版本」——不能因为走了兼容层就丢掉更新提示。
+  const script = `
+cerumusic.NoticeCenter('update', { version: 'v9.9', msg: '有新版' });
+module.exports = {
+  sources: { kw: { name: 'kw', type: 'music', actions: ['musicUrl'], qualitys: ['320k'] } },
+  musicUrl: async () => 'http://media.test/x.m4a',
+};
+`;
+  await bridgeCase(script, {
+    waitUntil: (evs) => evs.some((e) => e.type === 'event' && e.name === 'updateAlert'),
+    then: (b) => {
+      const alert = b.events().find((e) => e.type === 'event' && e.name === 'updateAlert');
+      assert.equal(alert.payload.version, 'v9.9');
     },
   });
 }
@@ -886,6 +950,8 @@ async function main() {
     ['init 前异步崩溃报 fatal', test_async_crash_before_init_is_fatal],
     ['init 后异步崩溃仅记日志', test_async_crash_after_init_only_logs],
     ['沙箱全局白名单', test_sandbox_global_whitelist],
+    ['Ceru 插件包装器适配', test_ceru_plugin_wrapper_adapter],
+    ['Ceru 更新提示转 updateAlert', test_ceru_wrapper_notices_reach_update_alert],
     ['未注册 handler 明确报错', test_missing_request_handler_replies_error],
   ];
 

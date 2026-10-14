@@ -29,7 +29,12 @@ fi
 # 兼容旧的向导开关（历史版本安装时可能记录）：显式 false 才跳过备份
 KEEP="${wizard_keep_data:-true}"
 case "${KEEP}" in
-    false|False|FALSE|0|no) exit 0 ;;
+    false|False|FALSE|0|no|wipe)
+        # 清空模式：不产生新备份，并删除历史卸载备份，用户数据不留任何痕迹
+        fnmusic_delete_backup_archives
+        echo "[fnmusic-ext] 清空模式：未保留用户数据，已删除历史卸载备份" >> "${FNMUSIC_LOG}"
+        exit 0
+        ;;
 esac
 
 if [ -z "${FNMUSIC_REPO_DIR}" ]; then
@@ -42,8 +47,8 @@ ITEMS="$(fnmusic_data_items)"
 # target symlink looks like /vol{n}/@appcenter/fnmusic-ext；解析失败时依次从
 # repo 路径推导（同为 /vol{n}/@appcenter/... 形态），仍失败才落到固定卷根。
 # 缺斜杠会变成 /vol1fnmusic-ext-backup-… 写到文件系统根上。
-VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
-[ -n "${VOL}" ] || VOL="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
+VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9][0-9]*/\).*#\1#p')"
+[ -n "${VOL}" ] || VOL="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9][0-9]*/\).*#\1#p')"
 VOL="${VOL:-/vol1/}"
 case "${VOL}" in
     */) ;;

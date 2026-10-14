@@ -48,7 +48,26 @@ CONF = {
 
 ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _resolve_static_dir() -> Path:
+    """优先读取 bind mount 里的前端，避免升级后镜像内旧页面继续被 NAS 窗口打开。"""
+    candidates: list[Path] = []
+    configured = (os.environ.get("WEBUI_STATIC_DIR") or "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path(CONF["repo_dir"]) / "webui-service" / "static")
+    candidates.append(Path(__file__).resolve().parent / "static")
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return candidates[-1].resolve()
+
+
+STATIC_DIR = _resolve_static_dir()
 
 # 音源进程 ↔ 启用开关（三选一互斥）
 PROVIDERS = {
@@ -68,6 +87,7 @@ SCHEMA: dict[str, dict] = {
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
+    "FNMUSIC_WAN_DIRECT": {"kind": "bool", "default": "true", "group": "quality", "reload": "hot", "label": "CDN 直连播放"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
@@ -85,6 +105,11 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    "FNMUSIC_CERU_SYNC_ENABLED": {"kind": "bool", "default": "false", "group": "sync", "reload": "hot", "label": "启用 Ceru 多端同步"},
+    "FNMUSIC_CERU_SYNC_HOST": {"kind": "str", "default": "", "group": "sync", "reload": "hot", "label": "服务器主机（只填域名）"},
+    "FNMUSIC_CERU_SYNC_PORT": {"kind": "int", "default": "31231", "min": 1, "max": 65535, "group": "sync", "reload": "hot", "label": "服务器端口"},
+    "FNMUSIC_CERU_SYNC_USE_HTTPS": {"kind": "bool", "default": "false", "group": "sync", "reload": "hot", "label": "HTTPS 安全访问"},
+    "FNMUSIC_CERU_SYNC_PAIR_CODE": {"kind": "str", "default": "", "group": "sync", "reload": "hot", "label": "登录绑定码"},
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
@@ -423,6 +448,13 @@ class ConfigBody(BaseModel):
     values: dict
 
 
+class CeruLoginBody(BaseModel):
+    host: str = ""
+    port: int = 31231
+    use_https: bool = False
+    pair_code: str = ""
+
+
 class PreviewBody(BaseModel):
     provider: str
 
@@ -522,6 +554,106 @@ async def api_config_put(body: ConfigBody, request: Request):
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys}
 
 
+def _ceru_base_url(host: str, port: int | str, use_https: bool) -> str:
+    host = str(host or "").strip()
+    if not host:
+        return ""
+    if "://" in host:
+        scheme, _, rest = host.partition("://")
+        host = rest.split("/", 1)[0].strip()
+        use_https = scheme.lower() == "https"
+    else:
+        host = host.split("/", 1)[0].strip()
+    try:
+        port_num = int(port or 31231)
+    except ValueError:
+        port_num = 31231
+    return f"{'https' if use_https else 'http'}://{host}:{port_num}"
+
+
+def _ceru_env() -> tuple[str, str]:
+    values = read_env()
+    base = _ceru_base_url(
+        values.get("FNMUSIC_CERU_SYNC_HOST", ""),
+        values.get("FNMUSIC_CERU_SYNC_PORT", "31231"),
+        values.get("FNMUSIC_CERU_SYNC_USE_HTTPS", "false").lower() in ("true", "1", "yes"),
+    )
+    token = str(values.get("FNMUSIC_CERU_SYNC_TOKEN") or "").strip()
+    return base, token
+
+
+@app.post("/api/ceru/login")
+async def api_ceru_login(body: CeruLoginBody):
+    base = _ceru_base_url(body.host, body.port, body.use_https)
+    if not base:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "请填写服务器主机"})
+    pair_code = str(body.pair_code or "").strip()
+    if not pair_code:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "请填写登录绑定码"})
+
+    async with httpx.AsyncClient(base_url=base, timeout=12.0, follow_redirects=True) as client:
+        try:
+            health = await client.get("/health")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"服务器不可达：{exc}"})
+        if health.status_code != 200:
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"服务器响应异常：HTTP {health.status_code}"})
+        try:
+            resp = await client.post("/auth/pair", json={"pairCode": pair_code})
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"登录请求失败：{exc}"})
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("error") or ""
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return JSONResponse(status_code=400, content={"ok": False, "error": detail or f"登录失败：HTTP {resp.status_code}"})
+        data = resp.json()
+        token = str(data.get("accessToken") or "")
+        if not token:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "服务器未返回登录凭据"})
+
+    try:
+        write_env({
+            "FNMUSIC_CERU_SYNC_TOKEN": token,
+            "FNMUSIC_CERU_SYNC_ENABLED": "true",
+            "FNMUSIC_CERU_SYNC_HOST": str(body.host).strip(),
+            "FNMUSIC_CERU_SYNC_PORT": str(int(body.port or 31231)),
+            "FNMUSIC_CERU_SYNC_USE_HTTPS": "true" if body.use_https else "false",
+            "FNMUSIC_CERU_SYNC_PAIR_CODE": pair_code,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"保存登录状态失败：{exc}"})
+
+    return {"ok": True, "message": "登录成功，同步服务已连接", "user": data.get("user")}
+
+
+@app.get("/api/ceru/status")
+async def api_ceru_status():
+    base, token = _ceru_env()
+    if not base:
+        return {"ok": False, "configured": False, "error": "未配置服务器地址"}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with httpx.AsyncClient(base_url=base, timeout=8.0, follow_redirects=True) as client:
+        try:
+            me = await client.get("/me", headers=headers)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "configured": True, "connected": False, "error": str(exc)}
+        if me.status_code == 200:
+            user = me.json()
+            counts: dict = {}
+            try:
+                snap = await client.get("/sync/snapshot", headers=headers)
+                if snap.status_code == 200 and isinstance(snap.json(), dict):
+                    counts = snap.json().get("counts") or {}
+            except Exception:  # noqa: BLE001
+                pass
+            return {"ok": True, "configured": True, "connected": True, "user": user, "counts": counts}
+        if me.status_code == 401:
+            return {"ok": False, "configured": True, "connected": False, "error": "未登录或绑定码无效，请重新登录"}
+        return {"ok": False, "configured": True, "connected": False, "error": f"HTTP {me.status_code}"}
+
+
 @app.post("/api/lx/verify")
 async def api_lx_verify(body: ConfigBody, request: Request):
     preview_renew("lxmusic")  # 预览期间测试源视为活跃，续期倒计时
@@ -592,6 +724,99 @@ async def api_lx_upload(request: Request):
         raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
 
 
+@app.get("/api/lx/sources")
+async def api_lx_sources(request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.get(f"{CONF['lx_url']}/api/v1/sources", timeout=15.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/sources")
+async def api_lx_sources_add(body: ConfigBody, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/sources",
+                                 json=body.values or {}, timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.delete("/api/lx/sources/{source_id}")
+async def api_lx_sources_remove(source_id: str, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.delete(f"{CONF['lx_url']}/api/v1/sources/{source_id}", timeout=30.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/sources/{source_id}/enabled")
+async def api_lx_sources_toggle(source_id: str, body: ConfigBody, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/sources/{source_id}/enabled",
+                                 json=body.values or {}, timeout=60.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/sources/{source_id}/check-update")
+async def api_lx_sources_check_update(source_id: str, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/sources/{source_id}/check-update", timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/sources/{source_id}/update")
+async def api_lx_sources_update(source_id: str, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/sources/{source_id}/update", timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/sources/{source_id}/auto-update")
+async def api_lx_sources_auto_update(source_id: str, body: ConfigBody, request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/sources/{source_id}/auto-update",
+                                 json=body.values or {}, timeout=60.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/source/check-update")
+async def api_lx_main_check_update(request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/source/check-update", timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+@app.post("/api/lx/source/update")
+async def api_lx_main_update(request: Request):
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/source/update", timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False}, status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
 @app.get("/api/platforms")
 async def api_platforms(request: Request):
     preview_renew("musicdl")  # 预览期间查看平台列表视为活跃，续期倒计时
@@ -649,7 +874,10 @@ async def netease_qr(unikey: str = Query(...)):
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

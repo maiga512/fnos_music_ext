@@ -27,13 +27,13 @@ env_flag() {
 }
 
 # 从 .env 导出音源运行期变量（已存在的环境变量不覆盖）：
-# lx 首次激活的 URL 种子 / 两源平台白名单
+# lx 首次激活的 URL 种子 / 两源平台白名单 / Node 二进制覆盖
 # 注意：函数末尾必须以成功命令收尾（调用方 set -e），分支一律用 if 而非 x && y
 export_source_env() {
     if [ ! -f "$ENV_FILE" ]; then
         return 0
     fi
-    for _key in LX_SOURCE_URL LX_SOURCES MUSICDL_SOURCES; do
+    for _key in LX_SOURCE_URL LX_SOURCES LX_NODE_BIN MUSICDL_SOURCES; do
         if printenv "$_key" >/dev/null 2>&1; then
             continue
         fi

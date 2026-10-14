@@ -1,3 +1,4 @@
+// TOP[top.webui.ui] 插件管理页前端：音源切换、洛雪源(每源版本号)、同步、音质设置
 /* fnmusic-ext WebUI — 原生 JS，无框架无外部资产。 */
 "use strict";
 
@@ -6,6 +7,29 @@
 const APP_BASE = "/app/fnmusic-ext";
 
 const $ = (sel) => document.querySelector(sel);
+function escapeHtml(value) {
+  const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" };
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => entities[ch]);
+}
+
+function versionLabel(version) {
+  const value = String(version || "").trim();
+  return value ? (value.toLowerCase().startsWith("v") ? value : `v${value}`) : "";
+}
+
+function redactSensitive(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return text
+    .replace(/([?&](?:key|token|api_key|apikey)=)[^&\s"']+/gi, "$1***")
+    .replace(/(CERU_KEY-)[A-Za-z0-9-]+/gi, "$1***");
+}
+
+function versionTag(version) {
+  const value = versionLabel(version);
+  return value
+    ? `<span class="version-tag">${escapeHtml(value)}</span>`
+    : '<span class="version-tag muted">版本未知</span>';
+}
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
@@ -78,12 +102,17 @@ async function loadStatus() {
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
       const s = st.lx_source.source;
+      $("#lx-main-version").innerHTML = versionTag(s && s.version);
       const rows = [];
       rows.push(`<div class="kv"><b>状态</b>${st.lx_source.initialized ? "已加载" : "未加载"}</div>`);
       if (s) {
-        rows.push(`<div class="kv"><b>源名称</b>${s.name || "-"} ${s.version ? "v" + s.version : ""}</div>`);
+        rows.push(`<div class="kv"><b>源名称</b>${s.name || "-"} ${versionLabel(s.version)}</div>`);
         rows.push(`<div class="kv"><b>平台</b>${Object.keys(s.platforms || {}).join("、") || "-"}</div>`);
         rows.push(`<div class="kv"><b>运行</b>${s.running ? "是" : "否"}</div>`);
+        if (s.update_alert) {
+          const text = redactSensitive(s.update_alert);
+          rows.push(`<div class="kv"><b>更新提示</b>${escapeHtml(text)}</div>`);
+        }
       }
       if (st.lx_source.last_error) rows.push(`<div class="kv"><b>错误</b>${st.lx_source.last_error}</div>`);
       $("#ov-lx").innerHTML = rows.join("");
@@ -131,7 +160,13 @@ function applyConfigToForm() {
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
+  $("#wan-direct").checked = v.FNMUSIC_WAN_DIRECT !== "false";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
+  $("#ceru-sync-enabled").checked = v.FNMUSIC_CERU_SYNC_ENABLED === "true";
+  $("#ceru-sync-host").value = v.FNMUSIC_CERU_SYNC_HOST || "";
+  $("#ceru-sync-port").value = v.FNMUSIC_CERU_SYNC_PORT || "31231";
+  $("#ceru-sync-use-https").checked = v.FNMUSIC_CERU_SYNC_USE_HTTPS === "true";
+  $("#ceru-sync-pair-code").value = v.FNMUSIC_CERU_SYNC_PAIR_CODE || "";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
   renderPlatformChips();
@@ -160,7 +195,13 @@ function collectConfig() {
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
     FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
+    FNMUSIC_WAN_DIRECT: $("#wan-direct").checked,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
+    FNMUSIC_CERU_SYNC_ENABLED: $("#ceru-sync-enabled").checked,
+    FNMUSIC_CERU_SYNC_HOST: $("#ceru-sync-host").value.trim(),
+    FNMUSIC_CERU_SYNC_PORT: parseInt($("#ceru-sync-port").value || "31231", 10) || 31231,
+    FNMUSIC_CERU_SYNC_USE_HTTPS: $("#ceru-sync-use-https").checked,
+    FNMUSIC_CERU_SYNC_PAIR_CODE: $("#ceru-sync-pair-code").value.trim(),
   };
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
@@ -209,6 +250,55 @@ async function saveConfig() {
   }
 }
 $("#save-btn").addEventListener("click", saveConfig);
+
+/* -------------------------------------------------------------- Ceru 同步 */
+async function ceruLogin() {
+  const btn = $("#ceru-login");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/ceru/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        host: $("#ceru-sync-host").value.trim(),
+        port: parseInt($("#ceru-sync-port").value || "31231", 10) || 31231,
+        use_https: $("#ceru-sync-use-https").checked,
+        pair_code: $("#ceru-sync-pair-code").value.trim(),
+      }),
+    });
+    $("#ceru-status-note").textContent = r.message || "已连接";
+    toast(r.message || "登录成功", "ok");
+    await loadConfig();
+    await ceruRefreshStatus();
+  } catch (exc) {
+    $("#ceru-status-note").textContent = "未连接";
+    toast("登录失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function ceruRefreshStatus() {
+  try {
+    const r = await api("/api/ceru/status");
+    const el = $("#ceru-status-note");
+    if (r.connected) {
+      const bits = [];
+      if (r.user && r.user.username) bits.push(r.user.username);
+      if (r.counts && typeof r.counts.playlists === "number") bits.push(`${r.counts.playlists} 个歌单`);
+      if (r.counts && typeof r.counts.favorites === "number") bits.push(`${r.counts.favorites} 首收藏`);
+      el.textContent = "已连接" + (bits.length ? " · " + bits.join(" · ") : "");
+    } else if (r.configured) {
+      el.textContent = r.error || "未连接";
+    } else {
+      el.textContent = "未配置";
+    }
+  } catch (_) {
+    $("#ceru-status-note").textContent = "未连接";
+  }
+}
+$("#ceru-login").addEventListener("click", ceruLogin);
+$("#ceru-status").addEventListener("click", ceruRefreshStatus);
 
 /* -------------------------------------------------------------- 音源选择 */
 function savedProvider() {
@@ -401,7 +491,7 @@ $("#lx-test").addEventListener("click", async () => {
       lxVerifiedUrl = url;
       box.className = "report ok";
       box.innerHTML =
-        `<div class="kv"><b>源名称</b>${meta.name || "-"} ${meta.version ? "v" + meta.version : ""}（${meta.author || "未知作者"}）</div>` +
+        `<div class="kv"><b>源名称</b>${meta.name || "-"} ${versionLabel(meta.version)}（${meta.author || "未知作者"}）</div>` +
         `<div class="kv"><b>可用平台</b>${(d.platforms || []).join("、")}</div>` +
         (probe.title ? `<div class="kv"><b>实测</b>${probe.title} - ${probe.artist} [${probe.platform}/${probe.quality}] ${probe.content_type || ""}</div>` : "") +
         `<div class="kv"><b>结论</b>可用 ✓（保存后激活）</div>`;
@@ -458,6 +548,391 @@ $("#lx-file").addEventListener("change", async () => {
   } finally {
     $("#lx-file").value = ""; // 允许重复选择同一文件
   }
+});
+
+/* -------------------------------------------------- lx 附加源池（多源启用/兜底） */
+let lxPoolRetryTimer = null;
+function renderLxPoolPlaceholder(text) {
+  const box = $("#lx-source-list");
+  box.innerHTML = `<div class="muted">${escapeHtml(text)}</div>`;
+}
+
+function lxSourceRow(it, index) {
+  const meta = it.source || {};
+  const version = meta.version || "";
+  const platforms = meta.platforms ? Object.keys(meta.platforms).join(" / ") : "";
+  const primary = !!it.primary;
+  const on = primary ? true : !!it.enabled;
+  let state;
+  if (it.running) state = '<span class="dot ok"></span>运行中';
+  else if (primary && it.configured === false) state = '<span class="dot"></span>未配置';
+  else if (it.last_error) state = '<span class="dot err"></span>异常';
+  else if (!on) state = '<span class="dot"></span>已停用';
+  else state = '<span class="dot warn"></span>待启动';
+  const err = it.last_error
+    ? `<div class="sub">错误：${escapeHtml(redactSensitive(it.last_error))}</div>` : "";
+  const alertInfo = it.update_alert
+    ? `<div class="sub">更新提示：${escapeHtml(redactSensitive(it.update_alert))}</div>` : "";
+  const badge = primary
+    ? '<span class="badge primary">主源</span>'
+    : `<span class="badge">附加 ${index}</span>`;
+  // 主源由安装流程激活、始终参与播放，不提供停用/删除；附加源可逐个开关
+  const poolSwitches = primary ? "" : `
+      <label class="sub"><input type="checkbox" class="lx-pool-enabled" ${it.enabled ? "checked" : ""}> 启用</label>
+      <label class="sub"><input type="checkbox" class="lx-pool-auto" ${it.auto_update ? "checked" : ""}> 检测到脚本变化自动更新</label>`;
+  const removeBtn = primary ? "" : '<button class="btn lx-pool-remove">删除</button>';
+  return `<div class="source-row${on ? "" : " is-off"}" data-lx-source="${escapeHtml(it.id)}"
+      data-primary="${primary ? "1" : ""}" data-current-version="${escapeHtml(version)}">
+    <div class="row-head">
+      ${state}
+      <span class="row-title">${escapeHtml(it.name || it.id)}</span>
+      ${badge}${versionTag(version)}
+      <span class="row-actions">
+        <button class="btn lx-src-check">检查更新</button>
+        <button class="btn lx-src-update">立即更新</button>
+        ${removeBtn}
+      </span>
+    </div>
+    <div class="sub">${escapeHtml(it.url || "本地上传脚本")}${platforms ? " · " + escapeHtml(platforms) : ""} · 版本：${escapeHtml(versionLabel(version) || "未知")}</div>
+    ${err}${alertInfo}${poolSwitches}
+  </div>`;
+}
+
+function renderLxSources(items) {
+  const box = $("#lx-source-list");
+  if (!items.length) {
+    box.innerHTML = '<div class="muted">还没有音源。用下面的地址或上传按钮添加洛雪源脚本。</div>';
+    return;
+  }
+  let poolIndex = 0;
+  box.innerHTML = items.map((it) => {
+    const index = it.primary ? 0 : (poolIndex += 1);
+    return lxSourceRow(it, index);
+  }).join("");
+
+  const rowOf = (el) => el.closest("[data-lx-source]");
+  const isPrimary = (row) => row.dataset.primary === "1";
+
+  box.querySelectorAll(".lx-pool-enabled").forEach((el) => {
+    el.addEventListener("change", async (ev) => {
+      const id = rowOf(ev.target).dataset.lxSource;
+      try {
+        await api(`/api/lx/sources/${encodeURIComponent(id)}/enabled`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: { enabled: ev.target.checked } }),
+        });
+        toast(ev.target.checked ? "已启用该源" : "已停用该源", "ok");
+      } catch (exc) { toast("切换失败：" + exc.message, "fail"); }
+      await loadLxPool();
+    });
+  });
+  box.querySelectorAll(".lx-pool-remove").forEach((el) => {
+    el.addEventListener("click", async (ev) => {
+      const id = rowOf(ev.target).dataset.lxSource;
+      try {
+        await api(`/api/lx/sources/${encodeURIComponent(id)}`, { method: "DELETE" });
+        toast("附加源已删除", "ok");
+      } catch (exc) { toast("删除失败：" + exc.message, "fail"); }
+      await loadLxPool();
+    });
+  });
+  box.querySelectorAll(".lx-pool-auto").forEach((el) => {
+    el.addEventListener("change", async (ev) => {
+      const id = rowOf(ev.target).dataset.lxSource;
+      try {
+        await api(`/api/lx/sources/${encodeURIComponent(id)}/auto-update`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: { auto_update: ev.target.checked } }),
+        });
+        toast(ev.target.checked ? "已开启自动更新" : "已关闭自动更新", "ok");
+      } catch (exc) { toast("设置失败：" + exc.message, "fail"); }
+      await loadLxPool();
+    });
+  });
+  box.querySelectorAll(".lx-src-check").forEach((el) => {
+    el.addEventListener("click", async (ev) => {
+      const row = rowOf(ev.target);
+      const primary = isPrimary(row);
+      const path = primary ? "/api/lx/source/check-update"
+        : `/api/lx/sources/${encodeURIComponent(row.dataset.lxSource)}/check-update`;
+      ev.target.disabled = true;
+      try {
+        const r = await api(path, { method: "POST" });
+        const d = r.data || {};
+        if (d.error) throw new Error(d.error);
+        const current = versionLabel(d.current_version || row.dataset.currentVersion);
+        const latest = versionLabel(d.latest_version || (d.meta || {}).version);
+        if (d.available && !d.auto_applied) {
+          toast(`发现新版本${latest ? ` ${latest}` : ""}${current ? `，当前 ${current}` : ""}，请点击“立即更新”`, "ok");
+        } else if (d.available) {
+          toast(`已自动更新${latest ? `到 ${latest}` : ""}`, "ok");
+        } else {
+          toast(`已是最新版本${current ? ` ${current}` : ""}`, "ok");
+        }
+      } catch (exc) { toast("检查更新失败：" + exc.message, "fail"); }
+      ev.target.disabled = false;
+      await loadLxPool();
+    });
+  });
+  box.querySelectorAll(".lx-src-update").forEach((el) => {
+    el.addEventListener("click", async (ev) => {
+      const row = rowOf(ev.target);
+      const primary = isPrimary(row);
+      const path = primary ? "/api/lx/source/update"
+        : `/api/lx/sources/${encodeURIComponent(row.dataset.lxSource)}/update`;
+      ev.target.disabled = true;
+      try {
+        const r = await api(path, { method: "POST" });
+        const d = r.data || {};
+        const version = versionLabel(d.source?.source?.version || d.source?.version || d.meta?.version);
+        if (primary) await loadStatus();
+        toast(d.updated ? `已更新并重启${version ? `到 ${version}` : ""}` : "无需更新", "ok");
+      } catch (exc) { toast("更新失败：" + exc.message, "fail"); }
+      ev.target.disabled = false;
+      await loadLxPool();
+    });
+  });
+}
+
+async function loadLxPool() {
+  // 页面打开时音源服务可能尚未启动：已有源不能因此显示为空。
+  const load = () => api("/api/lx/sources");
+  try {
+    const r = await load();
+    if (lxPoolRetryTimer) { clearTimeout(lxPoolRetryTimer); lxPoolRetryTimer = null; }
+    renderLxSources((r.data && r.data.items) || []);
+    return;
+  } catch (exc) {
+    const lxEnabled = configValues.FNMUSIC_LX_ENABLED === true || configValues.FNMUSIC_LX_ENABLED === "true";
+    if (lxEnabled && await startPreview("lxmusic")) {
+      try {
+        const r = await load();
+        if (lxPoolRetryTimer) { clearTimeout(lxPoolRetryTimer); lxPoolRetryTimer = null; }
+        renderLxSources((r.data && r.data.items) || []);
+        return;
+      } catch (_) { /* fall through：下面继续等待重试 */ }
+    }
+    // 升级/重装后容器重启，服务可能尚未就绪：显示空列表会让人以为源丢了。
+    // 改为显示等待提示并自动重试（数据一直保存在 sources-data/lxmusic/sources.json，不会丢失）。
+    if (lxEnabled && !lxPoolRetryTimer) {
+      renderLxPoolPlaceholder("音源服务尚未就绪：已有源不会丢失，正在自动重试…");
+      let tries = 0;
+      const tick = async () => {
+        lxPoolRetryTimer = null;
+        try {
+          const r = await load();
+          renderLxSources((r.data && r.data.items) || []);
+          return;
+        } catch (_) { /* 服务还没好，继续等 */ }
+        tries += 1;
+        if (lxEnabled && tries < 5) {
+          renderLxPoolPlaceholder(`音源服务尚未就绪，3 秒后重试…（${tries}/5）`);
+          lxPoolRetryTimer = setTimeout(tick, 3000);
+        } else {
+          renderLxPoolPlaceholder("音源服务未就绪：请刷新本页，或在概览页查看 lxmusic 状态。");
+        }
+      };
+      lxPoolRetryTimer = setTimeout(tick, 3000);
+    } else if (!lxEnabled) {
+      renderLxPoolPlaceholder("lxmusic 未启用：请先在上方音源选择中勾选「洛雪自定义源」。");
+    }
+  }
+}
+
+async function lxPoolAddUrl(url, name = "") {
+  const call = () => api("/api/lx/sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values: { url, name } }),
+  });
+  try {
+    const r = await call();
+    return r.data || {};
+  } catch (exc) {
+    if (!await startPreview("lxmusic")) throw exc;
+    const r = await call();
+    return r.data || {};
+  }
+}
+
+$("#lx-pool-add").addEventListener("click", async () => {
+  const url = $("#lx-pool-url").value.trim();
+  if (!url) { toast("请先填写附加洛雪源 URL", "fail"); return; }
+  try {
+    await lxPoolAddUrl(url);
+    $("#lx-pool-url").value = "";
+    toast("附加源已添加并启用", "ok");
+  } catch (exc) { toast("添加失败：" + exc.message, "fail"); }
+  await loadLxPool();
+});
+
+$("#lx-pool-upload").addEventListener("click", () => $("#lx-pool-file").click());
+async function lxPoolUploadFiles(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return { ok: 0, failed: [] };
+  const failed = [];
+  let ok = 0;
+  // 串行上传，避免一次选择多个脚本时并发打爆音源服务。
+  for (const file of list) {
+    try {
+      if (!file.name.toLowerCase().endsWith(".js")) throw new Error("只支持 .js 后缀文件");
+      if (file.size > 9_000_000) throw new Error("脚本超过 9MB 上限");
+      const r = await lxUploadScript(file.name, await file.text());
+      const url = (r.data || {}).url || "";
+      if (!url) throw new Error("上传未返回文件地址");
+      await lxPoolAddUrl(url, (r.data || {}).meta?.name || file.name);
+      ok += 1;
+    } catch (exc) {
+      failed.push(`${file.name}: ${exc.message}`);
+    }
+  }
+  return { ok, failed };
+}
+
+$("#lx-pool-file").addEventListener("change", async () => {
+  const files = $("#lx-pool-file").files;
+  try {
+    const result = await lxPoolUploadFiles(files);
+    if (!result.ok && !result.failed.length) return;
+    if (result.ok && !result.failed.length) toast(`已上传并启用 ${result.ok} 个附加洛雪源`, "ok");
+    else if (result.ok) toast(`已上传 ${result.ok} 个；失败 ${result.failed.length} 个`, "ok");
+    else toast(`上传失败：${result.failed[0]}`, "fail");
+  } catch (exc) {
+    toast("上传失败：" + exc.message, "fail");
+  } finally {
+    $("#lx-pool-file").value = "";
+  }
+  await loadLxPool();
+});
+
+/* ------------------------------------------------- 导入歌单（洛雪 JSON / 平台链接） */
+// 数据落在宿主数据根的一堆 JSON 文件里，由 webui_gateway 在宿主侧直接读写
+// （容器看不到那个目录），飞牛音乐「音乐」页再把这些歌单当在线歌单渲染。
+const IMP_ORIGIN_LABEL = { link: "链接导入", lxjson: "洛雪歌单" };
+
+function impTime(epoch) {
+  const sec = Number(epoch || 0);
+  if (!sec) return "-";
+  const d = new Date(sec * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function renderImported(items) {
+  const box = $("#imp-list");
+  if (!box) return;
+  if (!items.length) {
+    box.innerHTML = '<div class="muted">还没有导入歌单。粘贴一个分享链接或洛雪导出的歌单 JSON 试试。</div>';
+    return;
+  }
+  box.innerHTML = items.map((it) => {
+    const origin = IMP_ORIGIN_LABEL[it.origin] || it.origin || "导入";
+    const platform = it.platform ? ` · ${escapeHtml(String(it.platform).toUpperCase())}` : "";
+    const refreshBtn = it.refreshable ? '<button class="btn imp-refresh">刷新</button>' : "";
+    return `<div class="import-row" data-imp-id="${escapeHtml(it.id)}">
+      <span class="row-title">${escapeHtml(it.name || "未命名歌单")}</span>
+      <span class="badge">${Number(it.count || 0)} 首</span>
+      <span class="row-actions">${refreshBtn}<button class="btn imp-delete">删除</button></span>
+      <div class="sub">${escapeHtml(origin)}${platform} · 导入于 ${impTime(it.created_at)} · 更新于 ${impTime(it.updated_at)}</div>
+    </div>`;
+  }).join("");
+
+  const idOf = (el) => el.closest("[data-imp-id]").dataset.impId;
+  box.querySelectorAll(".imp-refresh").forEach((el) => {
+    el.addEventListener("click", async (ev) => {
+      const target = ev.target;
+      target.disabled = true;
+      target.textContent = "刷新中…";
+      try {
+        const r = await api("/api/playlists/imported/refresh", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: idOf(target) }),
+        });
+        const d = r.data || {};
+        toast(`已刷新：${d.name || "歌单"}（${Number(d.count || 0)} 首）`, "ok");
+      } catch (exc) { toast("刷新失败：" + exc.message, "fail"); }
+      await loadImported();
+    });
+  });
+  box.querySelectorAll(".imp-delete").forEach((el) => {
+    el.addEventListener("click", async (ev) => {
+      const row = ev.target.closest("[data-imp-id]");
+      if (!window.confirm(`删除歌单「${row.querySelector(".row-title").textContent}」？`)) return;
+      try {
+        await api("/api/playlists/imported/delete", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: row.dataset.impId }),
+        });
+        toast("已删除", "ok");
+      } catch (exc) { toast("删除失败：" + exc.message, "fail"); }
+      await loadImported();
+    });
+  });
+}
+
+async function loadImported() {
+  const box = $("#imp-list");
+  if (!box) return;
+  try {
+    const r = await api("/api/playlists/imported");
+    renderImported(r.data || []);
+  } catch (exc) {
+    box.innerHTML = `<div class="muted">导入歌单暂不可用：${escapeHtml(exc.message)}</div>`;
+  }
+}
+
+async function importPlaylistText(text, name) {
+  const r = await api("/api/playlists/import", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, name: name || "" }),
+  });
+  return (r.data || []).map((it) => `${it.name || "未命名歌单"}（${Number(it.count || 0)} 首）`).join("、");
+}
+
+$("#imp-submit").addEventListener("click", async () => {
+  const text = $("#imp-text").value.trim();
+  if (!text) { toast("请先粘贴歌单链接、口令或 JSON 内容", "fail"); return; }
+  const btn = $("#imp-submit");
+  btn.disabled = true;
+  btn.textContent = "导入中…";
+  try {
+    const label = await importPlaylistText(text, $("#imp-name").value.trim());
+    if (!label) throw new Error("没有识别到歌单：请确认链接是歌单（不是单曲/歌手），或 JSON 是洛雪导出的歌单");
+    toast(`已导入 ${label}`, "ok");
+    $("#imp-text").value = "";
+    $("#imp-name").value = "";
+  } catch (exc) {
+    toast("导入失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "导入";
+  }
+  await loadImported();
+});
+
+$("#imp-upload").addEventListener("click", () => $("#imp-file").click());
+$("#imp-file").addEventListener("change", async () => {
+  const file = $("#imp-file").files && $("#imp-file").files[0];
+  if (!file) return;
+  if (file.size > 8_000_000) { toast("文件超过 8MB 上限", "fail"); $("#imp-file").value = ""; return; }
+  const btn = $("#imp-submit");
+  btn.disabled = true;
+  btn.textContent = "导入中…";
+  try {
+    const text = await file.text();
+    const fallback = file.name.replace(/\.(json|txt|js)$/i, "");
+    const label = await importPlaylistText(text, $("#imp-name").value.trim() || fallback);
+    if (!label) throw new Error("文件里没有识别到歌单内容");
+    toast(`已导入 ${label}`, "ok");
+    $("#imp-name").value = "";
+  } catch (exc) {
+    toast("导入失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "导入";
+    $("#imp-file").value = "";
+  }
+  await loadImported();
 });
 
 /* NAS 文件选择：仅桌面环境（统一网关 /app/fnmusic-ext 内）可用。
@@ -517,10 +992,10 @@ $("#lx-pick").addEventListener("click", lxPickFromNas);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
+["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path", "#ceru-sync-host", "#ceru-sync-port", "#ceru-sync-pair-code"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#ceru-sync-enabled", "#ceru-sync-use-https"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {
@@ -543,6 +1018,10 @@ window.addEventListener("beforeunload", (ev) => {
 (async function boot() {
   await loadConfig();
   await loadStatus();
+  await ceruRefreshStatus();
+  await loadLxPool();
+  await loadImported();
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
+  setInterval(ceruRefreshStatus, 15000);
 })();

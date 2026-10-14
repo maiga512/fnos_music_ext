@@ -1,3 +1,4 @@
+# TOP[top.version] 版本号唯一来源：仓库根 VERSION 文件
 """fnmusic-ext 版本号管理.
 
 版本号规则（语义化）：

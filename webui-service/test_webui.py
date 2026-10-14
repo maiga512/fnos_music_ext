@@ -101,6 +101,29 @@ def test_config_view_merges_defaults(env_file):
         assert rj["schema"]["FNMUSIC_QUALITY_MODE"]["values"] == ["high", "balanced", "smooth"]
 
 
+def test_static_dir_prefers_repo_mount(tmp_path, monkeypatch):
+    """桌面窗口与网页管理台必须读取同一份最新前端，不能只吃镜像内静态文件。"""
+    repo_static = tmp_path / "webui-service" / "static"
+    repo_static.mkdir(parents=True)
+    (repo_static / "index.html").write_text("latest", encoding="utf-8")
+    monkeypatch.delenv("WEBUI_STATIC_DIR", raising=False)
+    monkeypatch.setitem(webui.CONF, "repo_dir", str(tmp_path))
+    assert webui._resolve_static_dir() == repo_static.resolve()
+
+
+def test_index_supports_lx_pool_bulk_upload():
+    """附加洛雪源文件选择必须允许一次选择多个脚本。"""
+    html = (webui.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="lx-pool-file" accept=".js" multiple hidden' in html
+
+
+def test_index_contains_sync_page():
+    """NAS 桌面窗口使用的管理页必须直接提供多端同步入口。"""
+    html = (webui.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'data-page="sync"' in html
+    assert "多端同步" in html
+
+
 # ------------------------------------------------------------------ PUT 校验 ---
 
 def test_put_rejects_unknown_key(env_file):
@@ -179,6 +202,39 @@ def test_search_timeout_defaults_and_saves(env_file):
         clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
         assert clamped.status_code == 200
     assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
+
+
+def test_ceru_sync_settings_persist_and_reload(env_file):
+    """NAS 管理窗口里的多端同步选项必须写入持久化 .env，重开页面仍能读回。"""
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_CERU_SYNC_ENABLED": True,
+            "FNMUSIC_CERU_SYNC_HOST": "nas.example.com",
+            "FNMUSIC_CERU_SYNC_PORT": 31231,
+            "FNMUSIC_CERU_SYNC_USE_HTTPS": True,
+            "FNMUSIC_CERU_SYNC_PAIR_CODE": "pair-123",
+        }})
+        assert saved.status_code == 200
+        assert set(saved.json()["changed"]) == {
+            "FNMUSIC_CERU_SYNC_ENABLED",
+            "FNMUSIC_CERU_SYNC_HOST",
+            "FNMUSIC_CERU_SYNC_PORT",
+            "FNMUSIC_CERU_SYNC_USE_HTTPS",
+            "FNMUSIC_CERU_SYNC_PAIR_CODE",
+        }
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_CERU_SYNC_ENABLED='true'" in text
+    assert "FNMUSIC_CERU_SYNC_HOST='nas.example.com'" in text
+    assert "FNMUSIC_CERU_SYNC_PORT='31231'" in text
+    assert "FNMUSIC_CERU_SYNC_USE_HTTPS='true'" in text
+    assert "FNMUSIC_CERU_SYNC_PAIR_CODE='pair-123'" in text
+    with authed_client() as client:
+        values = client.get("/api/config").json()["values"]
+        assert values["FNMUSIC_CERU_SYNC_ENABLED"] == "true"
+        assert values["FNMUSIC_CERU_SYNC_HOST"] == "nas.example.com"
+        assert values["FNMUSIC_CERU_SYNC_PORT"] == "31231"
+        assert values["FNMUSIC_CERU_SYNC_USE_HTTPS"] == "true"
+        assert values["FNMUSIC_CERU_SYNC_PAIR_CODE"] == "pair-123"
 
 
 def test_put_int_clamps_and_bool_normalizes(env_file):

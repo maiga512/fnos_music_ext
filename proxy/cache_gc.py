@@ -1,3 +1,4 @@
+# TOP[top.cache.gc] 缓存 GC：在线媒体/歌词/封面缓存清理
 #!/usr/bin/env python3
 """在线试听滚动缓存清理，运行时淘汰与 restore 还原共用；孤儿歌词清扫。
 

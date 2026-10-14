@@ -1,3 +1,4 @@
+# TOP[top.musicbox] 网易云：musicbox CLI 封装 + 扫码登录（VIP/无损、每日推荐）
 """HTTP wrapper for https://github.com/darknessomi/musicbox (NetEase-MusicBox CLI)."""
 from __future__ import annotations
 

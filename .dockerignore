@@ -12,6 +12,8 @@ proxy/*
 !proxy/env_merge.py
 **/__pycache__/
 **/*.pyc
+**/._*
+**/.DS_Store
 **/.pytest_cache/
 **/test_*.py
 **/*.md

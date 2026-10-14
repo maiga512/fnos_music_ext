@@ -318,13 +318,14 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
         streams.append(audio)
         resp = httpx.Response(200, stream=audio)
         chunks = resp.aiter_bytes()
-        return resp, None, "mp3", {}, chunks, await anext(chunks)
+        return resp, None, "mp3", {}, chunks, await anext(chunks), None, None
     monkeypatch.setattr(p, "_open_online_stream", opened)
     async def no_recovery(*args):
         return False
     monkeypatch.setattr(p, "_recover_source", no_recovery)
     response = await p.stream_track(req)
-    assert attempts == ["online:kuwo:1", "online:netease:2"]
+    # 首枪失败同候选补一枪（2.6.37 起 proxy 自己补 404 重试），再换候选
+    assert attempts == ["online:kuwo:1", "online:kuwo:1", "online:netease:2"]
     assert response.status_code == 307
     assert response.headers["location"].startswith("/")  # never absolute
     assert streams[0].closed  # prevalidation connection is not orphaned
@@ -339,7 +340,7 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
     assert await anext(response.body_iterator) == b"x" * 2048
     with pytest.raises(httpx.ReadError):
         await anext(response.body_iterator)
-    assert attempts == ["online:kuwo:1", "online:netease:2", "online:netease:2"]
+    assert attempts == ["online:kuwo:1", "online:kuwo:1", "online:netease:2", "online:netease:2"]
 
 
 @pytest.mark.anyio
@@ -363,7 +364,7 @@ async def test_fallback_redirect_survives_relayed_https_client(monkeypatch):
         audio = Audio()
         resp = httpx.Response(200, stream=audio)
         chunks = resp.aiter_bytes()
-        return resp, None, "mp3", {}, chunks, await anext(chunks)
+        return resp, None, "mp3", {}, chunks, await anext(chunks), None, None
 
     monkeypatch.setattr(p, "_open_online_stream", opened)
 
@@ -397,14 +398,15 @@ async def test_disabled_alternative_and_seek_never_cross_sources(monkeypatch):
     monkeypatch.setattr(p, "_open_online_stream", failed)
     monkeypatch.setattr(p, "_recover_source", no_recovery)
     assert (await p.stream_track(req)).status_code == 404
-    assert attempts == ["online:kuwo:1"]
+    assert attempts == ["online:kuwo:1", "online:kuwo:1"]
     attempts.clear()
     monkeypatch.setitem(p.CONF, "netease_enabled", True)
     req.scope["headers"].append((b"range", b"bytes=100-"))
     # Create a fresh Request to avoid cached headers.
     req = Request(req.scope)
     assert (await p.stream_track(req)).status_code == 404
-    assert attempts == ["online:kuwo:1"]
+    # seek 同样补一枪，但绝不跨源（netease 已启用也不出现在候选里）
+    assert attempts == ["online:kuwo:1", "online:kuwo:1"]
 
 
 @pytest.mark.anyio
@@ -531,7 +533,8 @@ async def test_gzip_audio_rejected_before_first_byte(tmp_path):
             "content-encoding": "gzip", "content-length": str(len(packed))})
     p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     response = await p.stream_track(request("guid=online:kuwo:1"))
-    assert response.status_code == 404 and seen == ["identity"]
+    # gzip 拒收 + 2.6.37 起首枪失败同候选补一枪 → 共两次请求，全部要求 identity
+    assert response.status_code == 404 and seen == ["identity", "identity"]
     assert not list(tmp_path.rglob("*.mp3"))
 
 

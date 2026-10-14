@@ -385,12 +385,12 @@ async def test_full_fetch_saves_library_for_windowed_client(monkeypatch):
         opens.append(range_header)
         if range_header is None:
             resp = httpx.Response(200, stream=Whole(full), headers={"content-length": str(len(full))})
-            return (resp, None, "flac", info, Done(), full)
+            return (resp, None, "flac", info, Done(), full, None, None)
         resp = httpx.Response(
             206, stream=Whole(full[:1024]),
             headers={"content-length": "1024", "content-range": f"bytes 0-1023/{len(full)}"},
         )
-        return (resp, None, "flac", info, Done(), full[:1024])
+        return (resp, None, "flac", info, Done(), full[:1024], None, None)
 
     monkeypatch.setattr(p, "_open_online_stream", fake_open)
     p._register_full_fetch(_fake_request(), guid)

@@ -931,14 +931,79 @@ WEBUI_FLAG="false"
 # 三源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
+
+# --- 可变数据根：必须落在升级不会被替换的目录 ---
+# 封面缓存 / 歌词 .lrc / 已下载音频 / Ceru→洛雪直连映射 / 歌单映射全部长在这里。
+# 现场实测：它们此前都在 ${BASE_DIR} 里，而 fnOS 升级会整体替换应用目录，
+# cover_cache 因此从 73 个文件一路被清到 3 个（cache 54→4），补好的封面与
+# 歌词每次更新都归零，只能重打官方接口——而官方接口有每日预算，永远追不回来。
+# 用飞牛给应用的持久 home（/var/apps/<app>/home -> /vol1/@apphome/<app>）做数据根。
+PKGVAR_DIR="${TRIM_PKGVAR:-/var/apps/fnmusic-ext}"
+DATA_HOME="${PKGVAR_DIR}/home/fnmusic-data"
+if ! mkdir -p "${DATA_HOME}/cache" 2>/dev/null || [ ! -w "${DATA_HOME}/cache" ]; then
+    log_warn "持久数据目录 ${DATA_HOME} 不可写，数据根回退到应用目录（升级会清空封面/歌词缓存）"
+    DATA_HOME="${BASE_DIR}"
+fi
+
+# 一次性迁移：老位置有文件、新位置还是空的才搬；已存在的文件一律不覆盖。
+fnmusic_migrate_data() {
+    local sub src dst
+    for sub in cache cover_cache online_favorites playlist_tracks play_history recommend_cache ceru_sync nm_playlists_cache imported_playlists; do
+        src="${BASE_DIR}/${sub}"
+        dst="${DATA_HOME}/${sub}"
+        [ -d "${src}" ] || continue
+        [ "${src}" = "${dst}" ] && continue
+        if [ -n "$(ls -A "${dst}" 2>/dev/null)" ]; then
+            continue
+        fi
+        mkdir -p "${dst}" || continue
+        if cp -a "${src}/." "${dst}/" 2>/dev/null; then
+            log_info "已迁移 ${sub} -> ${dst}"
+        fi
+    done
+}
+fnmusic_migrate_data
+
+# 二次一次性迁移：fnOS 应用中心升级时 TRIM_PKGVAR 可能换位置
+# （现场实测：/var/apps/<app> -> /vol1/@appdata/<app>），数据根随之改写，
+# 而旧数据根里的收藏/播放历史/同步状态/导入歌单/封面缓存还留在原地。
+# 这里把旧根（.env 里现存的 FNMUSIC_HOME）内容补齐到新根：
+# 只补缺失文件，绝不覆盖新根已有文件（新根可能持有更新的状态）。
+fnmusic_migrate_prev_home() {
+    local old_home sub src dst n0 n1
+    [ -f "${ENV_PATH}" ] || return 0
+    old_home="$(grep -E "^[[:space:]]*(export[[:space:]]+)?FNMUSIC_HOME=" "${ENV_PATH}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
+    [ -n "${old_home}" ] || return 0
+    [ "${old_home}" = "${DATA_HOME}" ] && return 0
+    [ -d "${old_home}" ] || return 0
+    log_info "检测到数据根变化 (${old_home} -> ${DATA_HOME})，补齐缺失文件（不覆盖已有）"
+    for sub in cache cover_cache online_favorites playlist_tracks play_history recommend_cache ceru_sync nm_playlists_cache imported_playlists; do
+        src="${old_home}/${sub}"
+        dst="${DATA_HOME}/${sub}"
+        [ -d "${src}" ] || continue
+        mkdir -p "${dst}" 2>/dev/null || continue
+        n0="$( { find "${dst}" -type f 2>/dev/null || true; } | wc -l | tr -d ' ')"
+        cp -an "${src}/." "${dst}/" 2>/dev/null || continue
+        n1="$( { find "${dst}" -type f 2>/dev/null || true; } | wc -l | tr -d ' ')"
+        if [ "${n1}" -gt "${n0}" ]; then
+            log_info "数据根迁移: ${sub} 补齐 $((n1 - n0)) 个文件 -> ${dst}"
+        fi
+    done
+}
+fnmusic_migrate_prev_home
+
 ENV_DESIRED="$(mktemp)"
 {
-    echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
-    echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/cache")'"
-    echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
-    echo "FNMUSIC_PLT_DIR='$(dotenv_escape "${BASE_DIR}/playlist_tracks")'"
-    echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
-    echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
+    echo "FNMUSIC_HOME='$(dotenv_escape "${DATA_HOME}")'"
+    echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${DATA_HOME}/cache")'"
+    echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${DATA_HOME}/online_favorites")'"
+    echo "FNMUSIC_PLT_DIR='$(dotenv_escape "${DATA_HOME}/playlist_tracks")'"
+    echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${DATA_HOME}/play_history")'"
+    echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${DATA_HOME}/recommend_cache")'"
+    echo "FNMUSIC_COVER_CACHE_DIR='$(dotenv_escape "${DATA_HOME}/cover_cache")'"
+    echo "FNMUSIC_CERU_SYNC_DIR='$(dotenv_escape "${DATA_HOME}/ceru_sync")'"
+    echo "FNMUSIC_NM_PLAYLISTS_DIR='$(dotenv_escape "${DATA_HOME}/nm_playlists_cache")'"
+    echo "FNMUSIC_IMPORT_PLAYLISTS_DIR='$(dotenv_escape "${DATA_HOME}/imported_playlists")'"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
     echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
     echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
@@ -981,6 +1046,11 @@ ENV_DESIRED="$(mktemp)"
 
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
+# 数据根迁移必须强制覆盖旧值：老安装把缓存写在应用目录里，升级整体替换时会被清空。
+# 只在确实拿到持久目录时才覆盖；回退到应用目录时不动用户既有配置。
+if [ "${DATA_HOME}" != "${BASE_DIR}" ]; then
+    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_HOME,FNMUSIC_CACHE_DIR,FNMUSIC_FAV_DIR,FNMUSIC_PLT_DIR,FNMUSIC_PLAY_HISTORY_DIR,FNMUSIC_RECOMMEND_DIR,FNMUSIC_COVER_CACHE_DIR,FNMUSIC_CERU_SYNC_DIR,FNMUSIC_NM_PLAYLISTS_DIR,FNMUSIC_IMPORT_PLAYLISTS_DIR"
+fi
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 # lx 源 URL 种子（校验通过后会再写一次推导出的 LX_SOURCES）
 [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_URL"
@@ -1114,7 +1184,9 @@ install_sources_container() {
     fi
     # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+    # 升级/重装必须重建容器，重新解析 /repo 与 /data bind mount。只 up 可能沿用
+    # 旧 inode/旧镜像进程，表现为“包已更新但 WebUI/源加载逻辑仍是旧版”。
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build --force-recreate; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
         log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
         log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"

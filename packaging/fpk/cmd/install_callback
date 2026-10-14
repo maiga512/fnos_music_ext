@@ -10,7 +10,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCES="${wizard_sources:-}"
 case "${SOURCES}" in
     musicdl|musicbox|lxmusic) ;;
-    *) SOURCES="musicdl" ;;
+    *) SOURCES="" ;;
 esac
 
 EXTEND="${wizard_extend:-true}"
@@ -34,6 +34,25 @@ if [ -f "${FNMUSIC_UNIT_FILE}" ]; then
 fi
 
 # 2. 存量手动/老目录部署数据平滑继承（.env/登录凭据/收藏/历史）
+# 2a. 卸载后重新安装：从最近一次卸载归档恢复洛雪附加源池。
+# 2a. 卸载后重新安装：从最近一次卸载归档恢复用户数据（卸载时用户选择「保留」的数据集）。
+# 逐项恢复且仅当新安装缺失：绝不覆盖已有文件。全新安装时 repo 为空，全部命中；
+# .env 恢复后由 install.sh 做安全增量合并（保留已有值、补新键），登录状态随
+# sources-data 一并继承；选择「清空」卸载时归档已被删除，这里自然无档可恢复。
+BACKUP_ARCHIVE="$(fnmusic_latest_backup_archive)"
+if [ -n "${BACKUP_ARCHIVE}" ]; then
+    for item in .env sources-data online_favorites online_favorites.json play_history; do
+        [ -e "${FNMUSIC_REPO_DIR}/${item}" ] && continue
+        if (set +o pipefail; tar -tzf "${BACKUP_ARCHIVE}" 2>/dev/null | grep -q "^${item}/\|^${item}$"); then
+            if tar -xzf "${BACKUP_ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" "${item}" >> "${FNMUSIC_LOG}" 2>&1; then
+                echo "[fnmusic-ext] 已从卸载备份恢复 ${item}: ${BACKUP_ARCHIVE}" >> "${FNMUSIC_LOG}"
+            else
+                echo "[fnmusic-ext] 卸载备份恢复 ${item} 失败，继续: ${BACKUP_ARCHIVE}" >> "${FNMUSIC_LOG}"
+            fi
+        fi
+    done
+fi
+
 DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
 if [ -f "${DEPLOYMENT_FILE}" ]; then
     OLD_BASE="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${DEPLOYMENT_FILE}" | head -n1)"
@@ -48,6 +67,12 @@ if [ -f "${DEPLOYMENT_FILE}" ]; then
 fi
 
 # 3. 组装安装参数：应用中心安装天然代表确立整机唯一部署，始终追加 --adopt
+# 向导未选音源时：继承 .env（卸载备份/旧部署恢复后）里用户已选的音源，
+# 避免重装时被默认 musicdl 覆盖；全新安装（无 .env）仍回退默认 musicdl。
+if [ -z "${SOURCES}" ]; then
+    SOURCES="$(fnmusic_saved_source)"
+fi
+[ -n "${SOURCES}" ] || SOURCES="musicdl"
 ARGS=(--non-interactive --sources "${SOURCES}" --webui --adopt)
 # 洛雪源脚本（URL/电脑上传/NAS 选择）统一装好后在管理页 WebUI 配置：
 # 安装向导平台没有文件上传组件，URL 也不再向安装者索要，无源安装不阻塞。

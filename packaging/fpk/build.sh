@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# TOP[top.fpk] FPK 打包：组装应用骨架 + 仓库主体 → fnpack build → dist
 
 # ==============================================================================
 # fnmusic-ext fpk 打包脚本（本地与 CI 共用）
@@ -66,6 +67,12 @@ command -v rsync >/dev/null 2>&1 || {
 # ------------------------------------------------------------------------------
 # 1. 组装打包目录
 # ------------------------------------------------------------------------------
+# TOP 图：打包前自动刷新 TOP.md 标签索引（tools/update_top_map.py，见 AGENTS.md）
+if command -v python3 >/dev/null 2>&1; then
+    python3 "${REPO_ROOT}/tools/update_top_map.py" \
+        || echo "[fpk] warn: TOP.md 标签索引刷新失败（不影响打包）" >&2
+fi
+
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/app/repo" "${STAGE}/app/ui"
 
@@ -86,6 +93,10 @@ rsync -a --delete \
     --exclude='recommend_cache/' --exclude='play_history/' \
     --exclude='online_favorites/' --exclude='online_favorites.json' \
     --exclude='*.fpk' \
+    --exclude='fnmusic-ext-*-src/' --exclude='fnmusic-ext-*-src.tar.gz' \
+    --exclude='fnmusic-ext-*-ceru-src/' --exclude='fnmusic-ext-*-ceru-src.tar.gz' \
+    --exclude='fnmusic-ext-*-final-src.tar.gz' \
+    --exclude='._*' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 
 # 应用骨架。fnpack 要求 manifest 版本为 x.y.z[-r]（r 为整数修订号）；自动
@@ -95,10 +106,20 @@ MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
 sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/"
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
+# 桌面入口 URL 带版本号，升级后让 fnOS WebView 重新加载新页面，不沿用旧缓存。
+sed "s/@VERSION@/${VERSION}/g" "${FPK_DIR}/app/ui/config" > "${STAGE}/app/ui/config"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
 cp -a "${FPK_DIR}/config" "${STAGE}/config"
 cp -a "${FPK_DIR}/wizard" "${STAGE}/wizard"
 chmod +x "${STAGE}"/cmd/*
+# macOS 解压/复制产生的 AppleDouble 元数据不能进入 FPK 载荷。
+find "${STAGE}" -name '._*' -type f -delete
+find "${STAGE}" -name '.DS_Store' -type f -delete
+# WebUI 静态资源必须带版本缓存键，升级后 WebView 不得复用旧 app.js。
+STATIC_INDEX="${STAGE}/app/repo/webui-service/static/index.html"
+STATIC_INDEX_TMP="${STATIC_INDEX}.tmp"
+sed "s/@VERSION@/${VERSION}/g" "${STATIC_INDEX}" > "${STATIC_INDEX_TMP}"
+mv "${STATIC_INDEX_TMP}" "${STATIC_INDEX}"
 
 echo "[fpk] 组装完成: ${STAGE} (version=${VERSION})"
 
@@ -113,19 +134,21 @@ if [ -z "${FNPACK_BIN}" ]; then
     if command -v fnpack >/dev/null 2>&1; then
         FNPACK_BIN="$(command -v fnpack)"
     else
-        case "$(uname -m)" in
-            x86_64) FNARCH=amd64 ;;
-            aarch64|arm64) FNARCH=arm64 ;;
-            *) echo "ERROR: 不支持的架构 $(uname -m)" >&2; exit 1 ;;
+        case "$(uname -s):$(uname -m)" in
+            Linux:x86_64) FNOS=linux; FNARCH=amd64 ;;
+            Linux:aarch64|Linux:arm64) FNOS=linux; FNARCH=arm ;;
+            Darwin:x86_64) FNOS=darwin; FNARCH=amd64 ;;
+            Darwin:arm64) FNOS=darwin; FNARCH=arm64 ;;
+            *) echo "ERROR: 不支持的系统/架构 $(uname -s) $(uname -m)" >&2; exit 1 ;;
         esac
         FNPACK_VERSION="${FNPACK_VERSION:-1.2.3}"
         TOOLS_DIR="${REPO_ROOT}/.tools"
         FNPACK_BIN="${TOOLS_DIR}/fnpack"
         if [ ! -x "${FNPACK_BIN}" ] || ! "${FNPACK_BIN}" --help >/dev/null 2>&1; then
             mkdir -p "${TOOLS_DIR}"
-            echo "[fpk] 下载 fnpack ${FNPACK_VERSION} (linux-${FNARCH})..."
+            echo "[fpk] 下载 fnpack ${FNPACK_VERSION} (${FNOS}-${FNARCH})..."
             curl -fsSL -o "${FNPACK_BIN}" \
-                "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-${FNARCH}"
+                "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-${FNOS}-${FNARCH}"
             chmod +x "${FNPACK_BIN}"
         fi
     fi

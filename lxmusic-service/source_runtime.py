@@ -1,3 +1,4 @@
+# TOP[top.lxsvc.runtime] 洛雪自定义源运行时：脚本校验 + Node 沙箱 + musicUrl 解析（含源版本号）
 """洛雪自定义源运行时：脚本下载/校验 + Node 沙箱进程管理 + musicUrl 解析。
 
 对齐洛雪桌面版自定义源规范（https://lxmusic.toside.cn/desktop/custom-source）：
@@ -10,19 +11,45 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import shutil
+import sysconfig
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from uuid import uuid4
 
 import httpx
 
 logger = logging.getLogger("lxmusic_service.runtime")
+
+
+_LANE_HOST_RE = re.compile(r"https?://([A-Za-z0-9._-]+)")
+
+
+def script_lane_key(script: str) -> str:
+    """把同一个上游运营商的脚本折叠到同一条取链队列上。
+
+    限流是按中转域名（多数还按 API key）计的：聆澜赞助版 v8.5/v8.8 和池里的
+    重复条目打的都是 source.shiqianjiang.cn 同一个账号，全豆要的三份副本同属
+    一套聚合链路。若按"条目 id"分道，等于对同一台上游主机开好几路并发，
+    正好是我们实测到的高并发限流。这里取脚本里出现最多的域名作为签名；
+    混淆后取不到域名的脚本（独家音源）退回按脚本内容哈希分道。
+    """
+    text = script or ""
+    counts: "dict[str, int]" = {}
+    for host in _LANE_HOST_RE.findall(text):
+        key = host.lower()
+        counts[key] = counts.get(key, 0) + 1
+    if counts:
+        return "host:" + max(counts, key=lambda k: (counts[k], k))
+    return "script:" + hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:16]
 
 SCRIPT_MAX_BYTES = 9_000_000
 MAX_REDIRECTS = 3
@@ -54,6 +81,43 @@ class SourceError(Exception):
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_node_bin() -> str:
+    """解析 Node 可执行文件：默认 ``node`` 时优先取真正的 ELF 二进制。
+
+    nodejs-wheel 这类打包会把 ``/usr/local/bin/node`` 做成 Python 包装脚本：
+    每个音源多驻留一个解释器进程（实测 1.5~8MB/个），且包装进程被 SIGTERM
+    时不会带真实 node 子进程一起退出，孤儿 node 会重挂到 init 常驻
+    （issue #29 的"多进程叠加"与此同源）。解析到非 ELF 时尝试
+    nodejs_wheel 内置二进制；``LX_NODE_BIN`` 显式指定时原样尊重。
+    """
+    raw = os.environ.get("LX_NODE_BIN", "").strip() or "node"
+    if raw != "node":
+        return raw
+    path = shutil.which(raw)
+    if not path:
+        return raw
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(4) == b"\x7fELF":
+                return raw
+    except OSError:
+        return raw
+    try:
+        wheel_bin = Path(sysconfig.get_path("purelib")) / "nodejs_wheel" / "bin" / "node"
+    except Exception:  # noqa: BLE001
+        return raw
+    if wheel_bin.is_file() and os.access(wheel_bin, os.X_OK):
+        return str(wheel_bin)
+    return raw
 
 
 def reap_orphan_bridges(
@@ -288,8 +352,10 @@ class UserSource:
     def __init__(self, script: str, meta: dict, *, script_dir: "str | None" = None):
         self.script = script
         self.meta = meta
-        self.node_bin = os.environ.get("LX_NODE_BIN", "node")
+        self.node_bin = _resolve_node_bin()
         self._script_dir = Path(script_dir or tempfile.gettempdir())
+        self._start_lock = asyncio.Lock()
+        self.last_used = 0.0
         self._script_path: "Path | None" = None
         self._proc: "asyncio.subprocess.Process | None" = None
         self._pending: dict[str, asyncio.Future] = {}
@@ -304,12 +370,20 @@ class UserSource:
         self.inited: dict = {}
         self.platforms: dict[str, dict] = {}
         self.started_at = 0.0
+        self.update_alert: Any = None
+        # 上游取链闸门的分道标识：同一家运营商（同一个中转域名）共用一条道
+        self.lane_key = script_lane_key(script)
 
     # ------------------------------------------------------------------ 生命周期
 
     async def start(self) -> None:
         if self._started:
             return
+        # 每次（重新）启动用全新事件：stop() 会把旧事件置位以解阻在途等待，
+        # 不复位的话重启会直接读到旧 inited payload，新进程初始化失败也照样"成功"
+        self._inited_event = asyncio.Event()
+        self._inited_payload = None
+        self._init_error = None
         bridge = Path(__file__).resolve().parent / "js" / "bridge.js"
         if not bridge.exists():
             raise SourceError("init", f"bridge script missing: {bridge}")
@@ -320,6 +394,8 @@ class UserSource:
         except OSError as exc:
             raise SourceError("init", f"无法写入脚本缓存: {exc}") from exc
         try:
+            # start_new_session：wrapper+node 自成进程组，stop() 按组清理
+            # （wrapper 脚本不转发 SIGTERM 时真实 node 也不会漏成孤儿）
             self._proc = await asyncio.create_subprocess_exec(
                 self.node_bin,
                 str(bridge),
@@ -328,6 +404,7 @@ class UserSource:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise SourceError("init", f"未找到 Node.js 运行时（{self.node_bin}）") from exc
@@ -386,22 +463,50 @@ class UserSource:
     async def stop(self) -> None:
         self._started = False
         self._inited_event.set()
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None:
-                task.cancel()
+        cancelled = [t for t in (self._reader_task, self._stderr_task) if t is not None]
+        for task in cancelled:
+            task.cancel()
+        if cancelled:
+            # 必须等旧任务彻底退出：它们的退出代码仍可能触碰 self 状态，
+            # 与紧随其后的 start()（新事件/新进程）形成竞态
+            await asyncio.gather(*cancelled, return_exceptions=True)
         self._reader_task = None
         self._stderr_task = None
         proc = self._proc
         if proc is not None:
-            try:
-                if proc.returncode is None:
-                    proc.terminate()
+            pid = getattr(proc, "pid", None)
+            # 仅当本进程是自建进程组组长（start_new_session）时按组杀，
+            # 否则退回逐进程信号，避免误杀宿主进程组
+            pgid = None
+            if pid is not None:
+                try:
+                    candidate = os.getpgid(pid)
+                except (OSError, TypeError):
+                    candidate = None
+                if candidate == pid:
+                    pgid = candidate
+            if proc.returncode is None:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), 3.0)
+                except asyncio.TimeoutError:
+                    try:
+                        if pgid is not None:
+                            os.killpg(pgid, signal.SIGKILL)
+                        else:
+                            proc.kill()
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
                     try:
                         await asyncio.wait_for(proc.wait(), 3.0)
                     except asyncio.TimeoutError:
-                        proc.kill()
-            except ProcessLookupError:
-                pass
+                        logger.warning("lx bridge pid=%s 仍在运行（SIGKILL 后），请人工检查", pid)
         self._proc = None
         self._fail_pending("source stopped")
         if self._script_path is not None and self._script_path.exists():
@@ -415,6 +520,9 @@ class UserSource:
 
     async def _read_loop(self) -> None:
         proc = self._proc
+        # 事件快照：stop()→start() 重启时旧 reader 可能晚于新事件创建才退出，
+        # 只允许它操作自己这一轮的事件，避免污染新进程的 init 等待
+        event = self._inited_event
         if proc is None or proc.stdout is None:
             return
         try:
@@ -430,12 +538,12 @@ class UserSource:
                 except Exception:  # noqa: BLE001
                     continue
                 if isinstance(msg, dict):
-                    self._dispatch(msg)
+                    self._dispatch(msg, event)
         finally:
             self._fail_pending("node process exited")
-            if not self._inited_event.is_set():
+            if not event.is_set():
                 self._init_error = "Node 进程提前退出"
-                self._inited_event.set()
+                event.set()
 
     async def _read_stderr(self) -> None:
         proc = self._proc
@@ -452,22 +560,24 @@ class UserSource:
         except Exception:  # noqa: BLE001
             pass
 
-    def _dispatch(self, msg: dict) -> None:
+    def _dispatch(self, msg: dict, event: "asyncio.Event | None" = None) -> None:
+        event = event if event is not None else self._inited_event
         mtype = msg.get("type")
         if mtype == "event":
             name = msg.get("name")
             payload = msg.get("payload")
             if name == "inited":
-                if not self._inited_event.is_set():
+                if not event.is_set():
                     self._inited_payload = payload
-                    self._inited_event.set()
+                    event.set()
             elif name == "fatal":
-                if not self._inited_event.is_set():
+                if not event.is_set():
                     self._init_error = str((payload or {}).get("error") or "bridge fatal")
-                    self._inited_event.set()
+                    event.set()
                 else:
                     self._fail_pending("bridge fatal")
             elif name == "updateAlert":
+                self.update_alert = payload
                 logger.info("lx source update alert: %s", str(payload or "")[:200])
         elif mtype == "log":
             level = str(msg.get("level") or "info")
@@ -505,7 +615,15 @@ class UserSource:
                         timeout: float = 10.0) -> str:
         """调用脚本 musicUrl；quality 为洛雪规范档位（128k/320k/flac/...）。"""
         if not self.running:
-            raise SourceError("init", "源运行时未就绪")
+            # 空闲回收/定期轮换后首个请求触发懒重建（冷启动 1-3s），链路不断；
+            # 从未初始化成功的源不做懒启动，避免每次请求都重试 30s init
+            if self.started_at > 0:
+                async with self._start_lock:
+                    if not self.running:
+                        await self.start()
+            if not self.running:
+                raise SourceError("init", "源运行时未就绪")
+        self.last_used = time.time()
         self._next_id += 1
         req_id = f"r{self._next_id}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -533,6 +651,13 @@ class UserSource:
             raise SourceError("resolve", "脚本未返回有效的 http 直链")
         return url
 
+    async def recycle(self) -> None:
+        """温和轮换：停止后重建（供内存守护使用；轮换期请求走懒重建/下家音源）。"""
+        await self.stop()
+        async with self._start_lock:
+            if not self.running:
+                await self.start()
+
     def describe(self) -> dict:
         # issue #29：暴露 bridge 进程 pid 与运行时长，便于用户上报"多进程/CPU 占用"时
         # 直接对照 healthz 与宿主 ps 输出（正常恒为单进程；多进程=容器/服务被外部拉起多次）
@@ -552,6 +677,7 @@ class UserSource:
             "started_at": self.started_at,
             "pid": pid,
             "uptime_s": uptime_s,
+            "update_alert": self.update_alert,
         }
 
 
@@ -669,12 +795,462 @@ class SourceManager:
             return runtime
         return None
 
+    def _cached_script(self) -> str:
+        try:
+            return self.script_cache.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    async def check_update(self) -> dict:
+        """重新下载当前源 URL，只比较 hash，不改运行态。"""
+        runtime = self.get()
+        alert = runtime.update_alert if runtime is not None else None
+        url = (
+            str((alert or {}).get("updateUrl") or "").strip()
+            if isinstance(alert, dict)
+            else ""
+        ) or (self.active_url or self.seed_url or "").strip()
+        if not url:
+            return {"available": False, "reason": "no_source_url"}
+        try:
+            latest = await download_script(url)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "error": str(exc)[:300]}
+        current = self._cached_script()
+        current_meta = parse_script_meta(current) if current else {}
+        current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest() if current else ""
+        latest_hash = hashlib.sha256(latest.encode("utf-8")).hexdigest()
+        latest_meta = parse_script_meta(latest)
+        return {
+            "available": latest_hash != current_hash,
+            "url": url,
+            "current_hash": current_hash,
+            "latest_hash": latest_hash,
+            "meta": latest_meta,
+            "current_meta": current_meta,
+            "current_version": current_meta.get("version", ""),
+            "latest_version": latest_meta.get("version", ""),
+        }
+
+    async def update(self) -> dict:
+        runtime = self.get()
+        alert = runtime.update_alert if runtime is not None else None
+        url = (
+            str((alert or {}).get("updateUrl") or "").strip()
+            if isinstance(alert, dict)
+            else ""
+        ) or (self.active_url or self.seed_url or "").strip()
+        if not url:
+            return {"updated": False, "reason": "no_source_url"}
+        try:
+            latest = await download_script(url)
+        except Exception as exc:  # noqa: BLE001
+            return {"updated": False, "error": str(exc)[:300]}
+        current = self._cached_script()
+        if current and hashlib.sha256(current.encode("utf-8")).hexdigest() == hashlib.sha256(latest.encode("utf-8")).hexdigest():
+            return {"updated": False, "reason": "already_latest", **self.describe()}
+        await self.activate(url, script=latest)
+        return {"updated": True, **self.describe()}
+
     def describe(self) -> dict:
         runtime = self.get()
+        meta = {}
+        try:
+            cached = self._cached_script()
+            if cached:
+                meta = parse_script_meta(cached)
+        except Exception:
+            pass
+        source = runtime.describe() if runtime is not None else {
+            "name": meta.get("name", ""), "version": meta.get("version", ""),
+            "author": meta.get("author", ""), "description": meta.get("description", ""),
+            "homepage": meta.get("homepage", ""), "platforms": {}, "running": False,
+        }
+        # script_hash：与源池同一算法（sha256 脚本正文），管理页用它把
+        # 「主源」与「附加源」合并成一份列表时去重，避免同一脚本显示两行
+        script_hash = ""
+        try:
+            cached = self._cached_script()
+            if cached:
+                script_hash = hashlib.sha256(cached.encode("utf-8")).hexdigest()
+        except Exception:
+            script_hash = ""
         return {
             "configured": bool(self.active_url or self.seed_url),
             "url": self.active_url or self.seed_url,
             "initialized": runtime is not None,
             "last_error": self.last_error,
-            "source": runtime.describe() if runtime is not None else None,
+            "script_hash": script_hash,
+            "meta": meta,
+            "source": source,
         }
+
+
+def memory_guard_enabled() -> bool:
+    """音源常驻内存守护开关（默认全关，保持现有行为）。
+
+    - LX_SOURCE_IDLE_REAP_S > 0：空闲超过阈值的音源进程被停止以释放内存；
+      下次播放时懒重建（冷启动 1-3s），播放链路不变、不中断活跃解析。
+    - LX_SOURCE_MAX_UPTIME_S > 0：运行时长超过阈值的空闲音源进程被轮换重建，
+      兜住脚本自身缓存膨胀（实测个别音源进程数日内可增长数十 MB）。
+    """
+    return (
+        _env_int("LX_SOURCE_IDLE_REAP_S", 0) > 0
+        or _env_int("LX_SOURCE_MAX_UPTIME_S", 0) > 0
+    )
+
+
+async def run_memory_guard(get_runtimes: "Callable[[], list[UserSource]]") -> None:
+    """后台守护：仅对"近期无请求"的音源生效，永不中断正在进行的解析。"""
+    while True:
+        idle_s = _env_int("LX_SOURCE_IDLE_REAP_S", 0)
+        max_uptime_s = _env_int("LX_SOURCE_MAX_UPTIME_S", 0)
+        if idle_s > 0 or max_uptime_s > 0:
+            now = time.time()
+            try:
+                runtimes = list(get_runtimes())
+            except Exception as exc:  # noqa: BLE001
+                runtimes = []
+                logger.warning("memory guard: 枚举音源运行时失败: %s", exc)
+            for rt in runtimes:
+                name = (rt.meta or {}).get("name") or rt.script[:24]
+                try:
+                    if not rt.running:
+                        continue
+                    idle_for = now - rt.last_used
+                    if idle_s > 0 and idle_for >= idle_s:
+                        logger.info(
+                            "lx source %s 空闲 %.0fs >= %ds，回收常驻进程", name, idle_for, idle_s
+                        )
+                        await rt.stop()
+                    elif (
+                        max_uptime_s > 0
+                        and now - rt.started_at >= max_uptime_s
+                        and idle_for >= min(300.0, float(max_uptime_s))
+                    ):
+                        logger.info(
+                            "lx source %s 运行 %.0fh 超阈值，轮换常驻进程",
+                            name, (now - rt.started_at) / 3600.0,
+                        )
+                        await rt.recycle()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("memory guard: %s 处理失败: %s", name, exc)
+        await asyncio.sleep(120)
+
+
+class MultiSourceManager:
+    """附加洛雪源池：同一时间可启用多个脚本，播放时按顺序逐个尝试。"""
+
+    def __init__(self, state_dir: "str | Path"):
+        self.state_dir = Path(state_dir)
+        self.sources_path = self.state_dir / "sources.json"
+        self.scripts_dir = self.state_dir / "sources"
+        self._entries: dict[str, dict] = {}
+        self._runtimes: dict[str, UserSource] = {}
+        self._loaded_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    def _read_sources(self) -> list[dict]:
+        try:
+            data = json.loads(self.sources_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        rows = data.get("sources") if isinstance(data, dict) else []
+        return [dict(row) for row in rows if isinstance(row, dict) and row.get("id")]
+
+    def _write_sources(self) -> None:
+        try:
+            self.scripts_dir.mkdir(parents=True, exist_ok=True)
+            rows = []
+            for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0)):
+                rows.append({
+                    "id": entry["id"],
+                    "name": entry.get("name") or "",
+                    "url": entry.get("url") or "",
+                    "enabled": bool(entry.get("enabled")),
+                    "auto_update": bool(entry.get("auto_update")),
+                    "position": int(entry.get("position") or 0),
+                    "script_file": entry.get("script_file") or "",
+                    "script_hash": entry.get("script_hash") or "",
+                    "added_at": entry.get("added_at") or int(time.time()),
+                })
+            self.sources_path.write_text(
+                json.dumps({"version": 1, "sources": rows}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("cannot persist multi-source state: %s", exc)
+
+    def _script_path(self, entry: dict) -> Path:
+        return self.scripts_dir / str(entry.get("script_file") or f"{entry['id']}.js")
+
+    async def _start_entry(self, entry: dict) -> None:
+        if self._runtimes.get(entry["id"]) is not None and self._runtimes[entry["id"]].running:
+            return
+        path = self._script_path(entry)
+        try:
+            script = path.read_text(encoding="utf-8")
+            meta = parse_script_meta(script)
+            runtime = UserSource(script, meta, script_dir=str(self.scripts_dir))
+            await runtime.start()
+            self._runtimes[entry["id"]] = runtime
+            entry["name"] = entry.get("name") or meta.get("name") or ""
+            entry["last_error"] = ""
+        except Exception as exc:  # noqa: BLE001
+            entry["last_error"] = str(exc)[:300]
+            logger.warning("additional lx source %s start failed: %s", entry["id"], exc)
+
+    async def wait_loaded(self, timeout: float = 5.0) -> bool:
+        try:
+            await asyncio.wait_for(self._loaded_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def load(self) -> None:
+        try:
+            async with self._lock:
+                for row in self._read_sources():
+                    self._entries[row["id"]] = row
+                for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0)):
+                    if not entry.get("script_hash"):
+                        try:
+                            script = self._script_path(entry).read_text(encoding="utf-8")
+                            entry["script_hash"] = hashlib.sha256(script.encode("utf-8")).hexdigest()
+                        except OSError:
+                            pass
+                # 元数据先发布；脚本进程初始化不能阻塞源列表接口。
+                self._loaded_event.set()
+                for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0)):
+                    if entry.get("enabled"):
+                        await self._start_entry(entry)
+                self._write_sources()
+        finally:
+            self._loaded_event.set()
+
+    async def add(self, url: str, *, script: "str | None" = None, name: str = "") -> dict:
+        async with self._lock:
+            script = script if script is not None else await download_script(url)
+            meta = parse_script_meta(script)
+            script_hash = hashlib.sha256(script.encode("utf-8")).hexdigest()
+            for existing in self._entries.values():
+                if existing.get("script_hash") and existing["script_hash"] == script_hash:
+                    existing_name = existing.get("name") or existing.get("id") or "未知音源"
+                    raise SourceError(
+                        "duplicate",
+                        f"“{existing_name}”已在音源池中（脚本内容相同）。重复添加同一脚本"
+                        "不会提高播放成功率，只会多占一个常驻 Node 进程；如需换新版请对已有条目点「更新」。",
+                    )
+            source_id = "src_" + hashlib.sha1(
+                f"{url}|{time.time()}|{uuid4().hex}".encode("utf-8")
+            ).hexdigest()[:12]
+            filename = f"{source_id}.js"
+            self.scripts_dir.mkdir(parents=True, exist_ok=True)
+            (self.scripts_dir / filename).write_text(script, encoding="utf-8")
+            entry = {
+                "id": source_id,
+                "name": str(name or meta.get("name") or "").strip(),
+                "url": url,
+                "enabled": True,
+                "auto_update": False,
+                "position": max([int(e.get("position") or 0) for e in self._entries.values()] or [-1]) + 1,
+                "script_file": filename,
+                "script_hash": script_hash,
+                "added_at": int(time.time()),
+                "last_error": "",
+            }
+            self._entries[source_id] = entry
+            await self._start_entry(entry)
+            self._write_sources()
+            return self._describe_entry(entry)
+
+    async def remove(self, source_id: str) -> bool:
+        async with self._lock:
+            entry = self._entries.pop(source_id, None)
+            if entry is None:
+                return False
+            runtime = self._runtimes.pop(source_id, None)
+            if runtime is not None:
+                await runtime.stop()
+            try:
+                self._script_path(entry).unlink()
+            except OSError:
+                pass
+            self._write_sources()
+            return True
+
+    async def set_enabled(self, source_id: str, enabled: bool) -> "dict | None":
+        async with self._lock:
+            entry = self._entries.get(source_id)
+            if entry is None:
+                return None
+            entry["enabled"] = bool(enabled)
+            if enabled:
+                await self._start_entry(entry)
+            else:
+                runtime = self._runtimes.pop(source_id, None)
+                if runtime is not None:
+                    await runtime.stop()
+            self._write_sources()
+            return self._describe_entry(entry)
+
+    async def set_auto_update(self, source_id: str, enabled: bool) -> "dict | None":
+        async with self._lock:
+            entry = self._entries.get(source_id)
+            if entry is None:
+                return None
+            entry["auto_update"] = bool(enabled)
+            self._write_sources()
+            return self._describe_entry(entry)
+
+    async def check_update(self, source_id: str) -> "dict | None":
+        entry = self._entries.get(source_id)
+        if entry is None:
+            return None
+        runtime = self._runtimes.get(source_id)
+        alert = runtime.update_alert if runtime is not None else None
+        url = (
+            str((alert or {}).get("updateUrl") or "").strip()
+            if isinstance(alert, dict)
+            else ""
+        ) or str(entry.get("url") or "").strip()
+        if not url:
+            return {"available": False, "reason": "no_source_url"}
+        try:
+            latest = await download_script(url)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "error": str(exc)[:300]}
+        latest_hash = hashlib.sha256(latest.encode("utf-8")).hexdigest()
+        current_hash = str(entry.get("script_hash") or "")
+        latest_meta = parse_script_meta(latest)
+        current_meta = {}
+        try:
+            current_meta = parse_script_meta(self._script_path(entry).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        available = latest_hash != current_hash
+        result = {
+            "available": available,
+            "url": url,
+            "current_hash": current_hash,
+            "latest_hash": latest_hash,
+            "meta": latest_meta,
+            "current_meta": current_meta,
+            "current_version": current_meta.get("version", ""),
+            "latest_version": latest_meta.get("version", ""),
+            "auto_update": bool(entry.get("auto_update")),
+        }
+        if available and entry.get("auto_update"):
+            updated = await self.update(source_id)
+            return {**result, "auto_applied": True, "update": updated}
+        return result
+
+    async def update(self, source_id: str) -> "dict | None":
+        async with self._lock:
+            entry = self._entries.get(source_id)
+            if entry is None:
+                return None
+            runtime = self._runtimes.get(source_id)
+            alert = runtime.update_alert if runtime is not None else None
+            url = (
+                str((alert or {}).get("updateUrl") or "").strip()
+                if isinstance(alert, dict)
+                else ""
+            ) or str(entry.get("url") or "").strip()
+            if not url:
+                return {"updated": False, "reason": "no_source_url"}
+            try:
+                latest = await download_script(url)
+            except Exception as exc:  # noqa: BLE001
+                return {"updated": False, "error": str(exc)[:300]}
+            latest_hash = hashlib.sha256(latest.encode("utf-8")).hexdigest()
+            if latest_hash == str(entry.get("script_hash") or ""):
+                return {"updated": False, "reason": "already_latest", "source": self._describe_entry(entry)}
+            meta = parse_script_meta(latest)
+            path = self._script_path(entry)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(latest, encoding="utf-8")
+            runtime = self._runtimes.pop(source_id, None)
+            if runtime is not None:
+                await runtime.stop()
+            entry.update({
+                "script_hash": latest_hash,
+                "name": entry.get("name") or meta.get("name") or "",
+                "last_error": "",
+                "url": url,
+            })
+            if entry.get("enabled"):
+                await self._start_entry(entry)
+            self._write_sources()
+            return {"updated": True, "source": self._describe_entry(entry)}
+
+    async def reorder(self, source_ids: list[str]) -> None:
+        async with self._lock:
+            positions = {sid: idx for idx, sid in enumerate(source_ids)}
+            for sid, entry in self._entries.items():
+                if sid in positions:
+                    entry["position"] = positions[sid]
+            self._write_sources()
+
+    def _describe_entry(self, entry: dict) -> dict:
+        runtime = self._runtimes.get(entry["id"])
+        meta = {}
+        try:
+            meta = parse_script_meta(self._script_path(entry).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        source = runtime.describe() if runtime is not None and runtime.running else {
+            "name": meta.get("name", ""), "version": meta.get("version", ""),
+            "author": meta.get("author", ""), "description": meta.get("description", ""),
+            "homepage": meta.get("homepage", ""), "platforms": {}, "running": False,
+        }
+        return {
+            "id": entry["id"],
+            "name": entry.get("name") or meta.get("name") or "",
+            "url": entry.get("url") or "",
+            "enabled": bool(entry.get("enabled")),
+            "auto_update": bool(entry.get("auto_update")),
+            "position": int(entry.get("position") or 0),
+            "script_hash": entry.get("script_hash") or "",
+            "running": bool(runtime is not None and runtime.running),
+            "last_error": entry.get("last_error") or "",
+            "update_alert": runtime.update_alert if runtime is not None and runtime.running else None,
+            "meta": meta,
+            "source": source,
+        }
+
+    def describe_all(self) -> list[dict]:
+        return [
+            self._describe_entry(entry)
+            for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0))
+        ]
+
+    def runtimes_for(self, platform: str) -> list["tuple[str, UserSource]"]:
+        out = []
+        for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0)):
+            if not entry.get("enabled"):
+                continue
+            runtime = self._runtimes.get(entry["id"])
+            if runtime is not None and runtime.running and platform in runtime.platforms:
+                out.append((entry["id"], runtime))
+        return out
+
+    def all_runtimes(self) -> list["tuple[str, UserSource]"]:
+        out = []
+        for entry in sorted(self._entries.values(), key=lambda e: int(e.get("position") or 0)):
+            if not entry.get("enabled"):
+                continue
+            runtime = self._runtimes.get(entry["id"])
+            if runtime is not None and runtime.running:
+                out.append((entry["id"], runtime))
+        return out
+
+    def configured(self) -> bool:
+        return bool(self._entries)
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            runtimes = list(self._runtimes.values())
+            self._runtimes.clear()
+            for runtime in runtimes:
+                await runtime.stop()

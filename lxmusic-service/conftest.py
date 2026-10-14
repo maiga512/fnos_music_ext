@@ -134,6 +134,12 @@ def isolated(monkeypatch) -> FakeManager:
     lxapp._CHAIN_HEALTH.clear()
     lxapp._STATS.update(searches=0, url_resolutions=0, errors=0)
     lxapp.LX_SEARCH_GATE.reset()
+    lxapp.LX_UPSTREAM_GATE.reset()
+    lxapp._KW_SONGINFO_CACHE.clear()
+    lxapp._KW_SONGINFO_INFLIGHT.clear()
+    lxapp._KW_SONGINFO_STATS.update(calls=0, hits=0, retries=0, miss=0)
+    if hasattr(lxapp, "reset_cover_search_state"):
+        lxapp.reset_cover_search_state()
     lxapp.app.state.http = None
     monkeypatch.setitem(lxapp.CONF, "search_probe", True)
     manager = FakeManager()

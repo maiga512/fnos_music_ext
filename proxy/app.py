@@ -21,11 +21,13 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, Coroutine
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import httpx
@@ -36,6 +38,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import recommend as dailyrec
     from . import nmplaylists as nmpl
+    from . import cerusync as ceru
+    from . import playlist_import as plimp
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
@@ -43,6 +47,8 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import nmplaylists as nmpl  # type: ignore
+    import cerusync as ceru  # type: ignore
+    import playlist_import as plimp  # type: ignore
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
@@ -87,11 +93,16 @@ CONF = {
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").lower() in ("true", "1", "yes"),
+    # 外网直连CDN（2.6.26 方案B）：在线歌解析出 CDN 直链后，先用“裸请求”（模拟手机、
+    # 不带 Referer/UA）验证 CDN 是否接受直连；通过则 307 重定向让手机直连 CDN 取流
+    # （绕过 NAS 中转，接近洛雪客户端直连体验）；验证失败或源不支持（仅 lx/netease）
+    # 时自动回落现有中转路径，起播率不劣于旧路径。默认开；管理页「播放与推荐」可关，立即生效。
+    "wan_direct_enabled": os.environ.get("FNMUSIC_WAN_DIRECT", "true").lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     # 输入停满这么久才向音源发起搜索。窗口内的新词会替换旧词并重新计时。
-    "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
+    "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "0.3")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -131,6 +142,7 @@ CONF = {
     # ffmpeg 输出 AAC fMP4 分片；宿主机无 ffmpeg 自动回落单分片桩
     "transcode_enabled": os.environ.get("FNMUSIC_TRANSCODE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "transcode_bitrate": os.environ.get("FNMUSIC_TRANSCODE_BITRATE", "128k"),
+    # 原版实测值：标准音质模式下手机端用 10s/片的 fMP4 能播（CHANGELOG）。
     "transcode_hls_time": float(os.environ.get("FNMUSIC_TRANSCODE_HLS_TIME", "10")),
     "transcode_max_sessions": int(os.environ.get("FNMUSIC_TRANSCODE_MAX_SESSIONS", "2")),
     "transcode_ttl_s": float(os.environ.get("FNMUSIC_TRANSCODE_TTL_S", "90")),
@@ -157,6 +169,10 @@ CONF = {
     "plt_dir": os.environ.get(
         "FNMUSIC_PLT_DIR", os.path.join(_HOME, "playlist_tracks")
     ),
+    # 导入歌单（洛雪 JSON / 五平台分享链接）的落盘目录，一单一文件
+    "import_dir": os.environ.get(
+        "FNMUSIC_IMPORT_PLAYLISTS_DIR", os.path.join(_HOME, "imported_playlists")
+    ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
     # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order）；
@@ -168,12 +184,21 @@ CONF = {
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
+    # Ceru 自部署同步服务：飞牛音乐作为一台设备接入，拉取歌单/收藏并双向回写。
+    # 默认关；URL + 配对码/账号密码齐备后由代理在音乐页注入 Ceru 歌单。
+    "ceru_sync_enabled": os.environ.get("FNMUSIC_CERU_SYNC_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "ceru_sync_host": (os.environ.get("FNMUSIC_CERU_SYNC_HOST") or "").strip(),
+    "ceru_sync_port": int(os.environ.get("FNMUSIC_CERU_SYNC_PORT") or "31231"),
+    "ceru_sync_use_https": os.environ.get("FNMUSIC_CERU_SYNC_USE_HTTPS", "false").lower() in ("true", "1", "yes"),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
     # =detail 时逐条记录。官方 App 更新引入新端点时（如 2.5.0 前的 download/*），
     # 日志可直接看到客户端在调什么，避免"Unknown 元数据"类问题无迹可循
     "trace_forward": os.environ.get("FNMUSIC_TRACE_FORWARD", "").strip().lower() in ("detail", "1", "true", "yes"),
 }
+
+# 导入歌单存储目录由代理统一持有（webui 侧通过 HTTP 接口读写，不共享文件系统）
+plimp.set_dir(CONF["import_dir"])
 
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
 
@@ -453,6 +478,7 @@ def _clean_search_cache() -> None:
             task.cancel()
 
 
+# TOP[top.search.cache] 搜索防抖与结果缓存（按用户×关键词 TTL，本地优先口径）
 def _set_search_cache(keyword: str, entry: dict) -> None:
     _clean_search_cache()
     _SEARCH_CACHE[keyword] = entry
@@ -465,6 +491,7 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
+    "FNMUSIC_WAN_DIRECT": ("wan_direct_enabled", "bool"),
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
@@ -483,6 +510,12 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_CERU_SYNC_ENABLED": ("ceru_sync_enabled", "bool"),
+    "FNMUSIC_CERU_SYNC_HOST": ("ceru_sync_host", "str"),
+    "FNMUSIC_CERU_SYNC_PORT": ("ceru_sync_port", "port"),
+    "FNMUSIC_CERU_SYNC_USE_HTTPS": ("ceru_sync_use_https", "bool"),
+    "FNMUSIC_CERU_SYNC_PAIR_CODE": ("", "str"),
+    "FNMUSIC_CERU_SYNC_TOKEN": ("", "str"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
     "FNMUSIC_TRANSCODE_BITRATE": ("transcode_bitrate", "str"),
@@ -554,9 +587,15 @@ def _env_watch_parse(raw: str, kind: str):
             return max(0, min(20, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "port":
+        try:
+            return max(1, min(65535, int(raw)))
+        except (TypeError, ValueError):
+            return None
     return raw
 
 
+# TOP[top.env] .env 热重载：2s 轮询，白名单键免重启生效
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回发生变化的 CONF 键名（空 = 无变化）。
 
@@ -922,6 +961,12 @@ def build_online_track(item: dict) -> dict:
         file_size = int(file_size or 0)
     except (TypeError, ValueError):
         file_size = 0
+    # 飞牛移动端会校验 audioSpec.size：为 0 时判定为无效音频，直接跳过、
+    # 连 stream 都不请求（网页端不校验，所以只有手机高失败率）。在线源在
+    # 解析直链之前拿不到真实字节数，用码率×时长估算一个合理值。
+    if file_size <= 0 and duration_s > 0:
+        est_bitrate = 1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000
+        file_size = int(duration_s * est_bitrate / 8)
     cover = str(item.get("cover_url") or "")
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
@@ -1161,6 +1206,7 @@ def _sniff_image_mime(data: bytes) -> str:
     return ""
 
 
+# TOP[top.cover] 封面下载/内嵌/缓存与清理（负面缓存、内网地址判定、歌单回补）
 def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
     """下载封面图字节（内嵌用）。非图片/超限/酷我文本假图/网络失败一律返回 None。"""
     url = str(url or "").strip()
@@ -1534,6 +1580,7 @@ async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str
         return None
 
 
+# TOP[top.lyric] 歌词解析与回补：音源歌词 → 本地缓存 → musicdl 兜底
 async def resolve_online_lyric(request: Request, guid: str) -> str:
     """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
     cached = read_lyric_cache(guid)
@@ -1577,7 +1624,93 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
             title=str((data or {}).get("title") or ""),
             artist=str((data or {}).get("artist") or ""),
         )
+    else:
+        # fast=1 没拿到词：后台全模式回补（带 title/artist），下次拉取即得
+        _ensure_lyric_backfill(request, guid, data)
     return text
+
+
+# === 2.6.36 歌词后台回补：fast 路径拿不到词（播放源无缓存词）时，
+# 后台用全模式（跨 5 平台搜索回退，服务端带 title/artist）再要一次，
+# 成功落 .lrc 缓存，客户端下次拉取即得。10min 冷却 + single-flight。 ===
+_LYRIC_BACKFILL_INFLIGHT: set[str] = set()
+_LYRIC_BACKFILL_AT: dict[str, float] = {}
+_LYRIC_BACKFILL_COOLDOWN_S = 600.0
+
+
+async def _lyric_backfill_task(request: Request, guid: str, data: "dict | None") -> None:
+    await asyncio.sleep(_LYRIC_STAGGER_S)  # 让主流/封面先跑，20s 预算往后让
+    d = data if isinstance(data, dict) else {}
+    title = str(d.get("title") or "").strip()
+    artist = str(d.get("artist") or "").strip()
+    if not (title or artist):
+        song = ceru.song_for_guid(guid)
+        if song:
+            title = title or ceru.song_title(song)
+            artist = artist or ceru.song_artist(song)
+    if not (title or artist):
+        try:
+            info = await _online_info(request, guid, include_lyric=False)
+            if info:
+                title = title or str(info.get("title") or "").strip()
+                artist = artist or str(info.get("artist") or "").strip()
+        except Exception:
+            pass
+    if not (title or artist):
+        return
+    lx_client = get_lx_client(request.app)
+    try:
+        r = await lx_client.get(
+            "/api/v1/track/lyric",
+            params={
+                "id": song_id_from_online_guid(guid),
+                "title": title,
+                "artist": artist,
+            },
+            timeout=20.0,
+        )
+        payload = r.json() if r.status_code == 200 else {}
+        if isinstance(payload, dict) and payload.get("ok") is not False:
+            text = str((payload.get("data") or {}).get("lyric") or "").strip()
+            if text:
+                write_lyric_cache(guid, text, title=title, artist=artist)
+                logger.info("lyric backfill ok for %s (%d chars)", guid, len(text))
+    except Exception as e:
+        logger.debug("lyric backfill failed for %s: %s", guid, e)
+
+
+def _ensure_lyric_backfill(request: Request, guid: str, data: "dict | None" = None) -> bool:
+    if not is_online_guid(guid) or source_from_online_guid(guid) != "lx":
+        return False
+    if read_lyric_cache(guid):
+        return False
+    if not _source_enabled(guid):
+        return False
+    if guid in _LYRIC_BACKFILL_INFLIGHT:
+        return False
+    global _LYRIC_JOB_ACTIVE
+    if _LYRIC_JOB_ACTIVE >= _LYRIC_JOB_MAX:
+        return False
+    last = _LYRIC_BACKFILL_AT.get(guid)
+    if last is not None and time.monotonic() - last < _LYRIC_BACKFILL_COOLDOWN_S:
+        return False
+    _LYRIC_JOB_ACTIVE += 1
+    _LYRIC_BACKFILL_INFLIGHT.add(guid)
+    _LYRIC_BACKFILL_AT[guid] = time.monotonic()
+
+    def _done(task: "asyncio.Task") -> None:
+        global _LYRIC_JOB_ACTIVE
+        _LYRIC_JOB_ACTIVE -= 1
+        _LYRIC_BACKFILL_INFLIGHT.discard(guid)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except Exception:  # noqa: BLE001
+                pass
+
+    task = asyncio.create_task(_lyric_backfill_task(request, guid, data))
+    task.add_done_callback(_done)
+    return True
 
 
 def media_type_for_ext(ext: str) -> str:
@@ -1736,6 +1869,7 @@ def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+# TOP[top.forward] 官方 API 透传：未接管的请求原样转发官方后端（Unix socket）
 async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
     url_path = request.url.path
     if request.url.query:
@@ -2062,7 +2196,528 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
 _NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster"]
 _LX_QUALITY_LADDER = ["standard", "high", "lossless"]
 
+# 在线媒体（尤其洛雪直链）下载时必须带的请求头。
+# lxmusic-service 用浏览器 UA 探活成功，但它回给 proxy 的 data 里不带 headers；
+# proxy 若用 httpx 默认 UA（python-httpx/...）去取流，酷我 CDN 会直接 403，
+# 表现为“源里能播、飞牛却跳歌”。这里按平台补齐 UA / Referer。
+_MEDIA_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_MEDIA_REFERER = {
+    "kw": "http://www.kuwo.cn/",
+    "kg": "https://www.kugou.com/",
+    "tx": "https://y.qq.com/",
+    "wy": "https://music.163.com/",
+    "mg": "https://music.migu.cn/",
+}
 
+# 洛雪播放地址缓存（10 分钟）与“原曲→可用替代平台”记忆（1 小时）。
+# 目的：重复播放/切回上一首直接命中，不再重复解析；原平台失败后直接走上次成功的替代源。
+_LX_URL_CACHE: dict[str, tuple[dict, float]] = {}
+# 网易直链同样存在“HEAD + GET”重复解析；按客户端对象隔离缓存，避免测试或
+# 多副本场景把不同 mock/会话的 URL 混用。
+_NETEASE_URL_CACHE: dict[tuple[int, str], tuple[str, float]] = {}
+_NETEASE_URL_CACHE_TTL_S = 30 * 60.0
+# 平台直链普遍 1~2 小时有效；缓存越久，重复播放/来回切歌就越不需要
+# 再打用户源，限流窗口里这一点尤其关键。
+_LX_URL_CACHE_TTL_S = 30 * 60.0
+# 2.6.39 播放成功率对齐安卓：已确认失效的直链（首字节取不到 / 中途断流且重连
+# 耗尽）在 TTL 内不再下发（等价安卓 failedUrls 排除）；该曲后续取链从更低音质
+# 档起步（等价安卓播放报错 → 音质阶梯回退）。
+_LX_DEAD_URLS: dict[str, dict[str, float]] = {}
+_LX_DEAD_URL_TTL_S = 30 * 60.0
+_LX_STREAM_FAILS: dict[str, int] = {}
+_LX_STREAM_FAIL_AT: dict[str, float] = {}
+_LX_STREAM_FAIL_TTL_S = 30 * 60.0
+_LX_MAX_TIER_DOWNGRADE = 2
+
+
+def _lx_dead_urls(song_id: str) -> set:
+    """该曲目 TTL 内已确认失效的直链集合（惰性清理）。"""
+    d = _LX_DEAD_URLS.get(song_id) or {}
+    now = time.time()
+    live = {u for u, ts in d.items() if now - ts < _LX_DEAD_URL_TTL_S}
+    if live:
+        _LX_DEAD_URLS[song_id] = {u: d[u] for u in live}
+    else:
+        _LX_DEAD_URLS.pop(song_id, None)
+    return live
+
+
+def _lx_tier_downgrade_steps(song_id: str) -> int:
+    """该曲目流失败次数 → 下次取链的降档步数（封顶 _LX_MAX_TIER_DOWNGRADE）。"""
+    ts = _LX_STREAM_FAIL_AT.get(song_id)
+    if ts is None or time.time() - ts >= _LX_STREAM_FAIL_TTL_S:
+        _LX_STREAM_FAIL_AT.pop(song_id, None)
+        _LX_STREAM_FAILS.pop(song_id, None)
+        return 0
+    return min(int(_LX_STREAM_FAILS.get(song_id, 0)), _LX_MAX_TIER_DOWNGRADE)
+
+
+def _lx_mark_url_dead(song_id: str, url: str) -> None:
+    """一条直链确认失效：记死链 + 记一次流失败，并清掉该曲的 URL 缓存，
+    让下一次取链走全新的解析（换档/换源/换曲候选）。"""
+    if not song_id or not url:
+        return
+    now = time.time()
+    d = _LX_DEAD_URLS.setdefault(song_id, {})
+    d[url] = now
+    if now - _LX_STREAM_FAIL_AT.get(song_id, 0.0) >= _LX_STREAM_FAIL_TTL_S:
+        n = 0
+    else:
+        n = int(_LX_STREAM_FAILS.get(song_id, 0))
+    n += 1
+    _LX_STREAM_FAILS[song_id] = n
+    _LX_STREAM_FAIL_AT[song_id] = now
+    _LX_URL_CACHE.pop(song_id, None)
+    if n <= 3 or n % 10 == 0:
+        logger.warning("lx stream dead for %s (fails=%d): %s", song_id, n, url[:140])
+
+
+def _lx_reset_stream_fails(song_id: str) -> None:
+    """解析成功即重置降档计数（死链记录保留——那条具体链接仍然失效）。"""
+    _LX_STREAM_FAILS.pop(song_id, None)
+    _LX_STREAM_FAIL_AT.pop(song_id, None)
+
+
+_LX_ALT_CACHE: dict[str, tuple[str, float]] = {}
+_LX_ALT_CACHE_TTL_S = 60 * 60.0
+_LX_PLATFORM_HEALTH: dict[str, dict[str, float]] = {}
+_LX_ALT_META_CACHE: dict[str, dict] = {}
+_LX_ALT_META_LOADED = False
+_LX_ALT_META_SAVE_LAST = 0.0
+_LX_ALT_META_PATH = os.path.join(CONF.get("cache_dir") or _HOME, "lx_alt_meta.json")
+_CERU_LX_ITEM_CACHE: dict[str, dict] = {}
+_CERU_LX_ITEM_LOADED = False
+_CERU_LX_ITEM_SAVE_LAST = 0.0
+_CERU_LX_ITEM_PATH = os.path.join(CONF.get("cache_dir") or _HOME, "ceru_lx_items.json")
+_LX_PREFETCH_RUNNING: set[str] = set()
+_LX_PREFETCH_TASKS: set[asyncio.Task] = set()
+# 2.6.53（树夏方案移植）：预取探测验证表。song_id -> (url, ts, status)。
+# direct=手机口径裸探测通过 → 播放主路径跳过 inline 探测直接 307；
+# relay=链活着但防盗链要源请求头 → 照常走中转；
+# dead=链已确认失效（4xx）→ 记死链、后台重取；
+# unknown=网络抖动/超时 → 不动缓存，下轮再验。
+# 探测只打 CDN（Range 小请求），不消耗用户源取链配额。
+_LX_URL_PROBE: dict[str, tuple[str, float, str]] = {}
+_LX_PROBE_VERIFYING: set[str] = set()
+_LX_PROBE_FRESH_S = float(os.environ.get("FNMUSIC_PREFETCH_PROBE_FRESH_S", "600"))
+# 飞牛客户端自己维护播放队列，proxy 拿不到“下一首是谁”。退而求其次：
+# 记住最近一次下发的歌单页顺序，播放当前首时就预取页内下一首的直链，
+# 让切歌尽量命中已解析的 URL（对齐桌面端 prefetchNextTrack 的效果）。
+_CERU_LAST_PAGE_GUIDS: list[str] = []
+_CERU_PAGE_INDEX: dict[str, int] = {}
+_CERU_PREFETCH_AT: dict[str, float] = {}
+_CERU_PREFETCH_COOLDOWN_S = 120.0
+# 向后预取几首：越大切歌越可能命中已解析直链，也越多后台取链。3 首是
+# "切歌基本不等" 与 "不打爆公益源" 的折中；忙时服务端闸门会直接甩掉多余预取。
+_CERU_PREFETCH_WINDOW = int(os.environ.get("FNMUSIC_PREFETCH_WINDOW", "3"))
+# 按平台冷却：上游故障通常只影响单个平台（例如酷狗网关 ECONNRESET），
+# 锁整个歌单会造成“整页连续跳歌”，所以只冷却出问题的平台，其余平台继续用。
+_LX_PLATFORM_COOLDOWN: dict[str, float] = {}
+_LX_PLATFORM_COOLDOWN_S = 10.0
+# 单曲解析失败后的短时负缓存：切歌队列会在几秒内反复请求同一首，
+# 没有负缓存就会把同一发失败请求连续打给上游，既慢又加速限流。
+_LX_FAIL_COOLDOWN: dict[str, float] = {}
+_LX_FAIL_COOLDOWN_S = 15.0
+# 上游解析网关故障（连接重置/挂断）不是单曲无货，命中后短暂全局退避，
+# 避免整张歌单在同一故障窗口里被逐首打穿。
+_LX_UPSTREAM_FAULT_MARKERS = (
+    "econnreset",
+    "und_err_socket",
+    "socket hang up",
+    "connection reset",
+    "fetch failed",
+    "请求过于频繁",
+    "too many requests",
+)
+# 服务端取链队列已满（503）的退避。503 是毫秒级返回的，代理若照旧「立刻换候选/
+# 换档重试」就会雪崩：100 首并发起播实测队列被打到 20+ 深、26 首在 100ms 内吃 404，
+# 完全是自己把队列撞爆，不是上游慢。所以：先等一小会儿原地补一枪，仍满则打开
+# 全局 2s 短时退避（对所有取链收手），并且不再写单曲 15s 冷却——那不是无货。
+_LX_QUEUE_RETRY_DELAY_S = 1.2
+_LX_QUEUE_BACKOFF_S = 2.0
+_LX_QUEUE_BACKOFF_UNTIL = 0.0
+_BG_HEADER = "X-Fnmusic-Bg"
+_COVER_VERSION_RE = re.compile(r":cover\d+$")
+_COVER_ENTITY_VERSION_RE = re.compile(r":(?:album|artist):cover\d+$")
+
+
+def _lx_platform_of(song_id: str) -> str:
+    parts = str(song_id or "").split(":")
+    return parts[2] if len(parts) >= 3 and parts[1] == "lx" else ""
+
+
+def _lx_platform_cooled(song_id: str) -> bool:
+    plat = _lx_platform_of(song_id)
+    return bool(plat) and time.time() < _LX_PLATFORM_COOLDOWN.get(plat, 0.0)
+
+
+# TOP[top.lx.health] 洛雪源健康度：成功/失败统计、平台冷却、替代源元数据
+def _lx_health_report(song_id: str, ok: bool) -> None:
+    src = _lx_platform_of(song_id)
+    if not src:
+        return
+    h = _LX_PLATFORM_HEALTH.setdefault(src, {"ok": 0.0, "fail": 0.0, "last_fail": 0.0})
+    if ok:
+        h["ok"] = float(h.get("ok") or 0) + 1
+    else:
+        h["fail"] = float(h.get("fail") or 0) + 1
+        h["last_fail"] = time.time()
+
+
+def _lx_health_rank(song_id: str) -> float:
+    src = _lx_platform_of(song_id)
+    h = _LX_PLATFORM_HEALTH.get(src) or {}
+    ok = float(h.get("ok") or 0)
+    fail = float(h.get("fail") or 0)
+    return fail / max(1.0, ok + fail)
+
+
+def _load_lx_alt_meta() -> None:
+    global _LX_ALT_META_LOADED
+    if _LX_ALT_META_LOADED:
+        return
+    _LX_ALT_META_LOADED = True
+    try:
+        with open(_LX_ALT_META_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items") if isinstance(data, dict) else None
+        if isinstance(items, dict):
+            _LX_ALT_META_CACHE.update({k: v for k, v in items.items() if isinstance(v, dict)})
+    except Exception:
+        pass
+
+
+def _save_lx_alt_meta(force: bool = False) -> None:
+    global _LX_ALT_META_SAVE_LAST
+    now = time.monotonic()
+    if not force and now - _LX_ALT_META_SAVE_LAST < 5.0:
+        return
+    _LX_ALT_META_SAVE_LAST = now
+    try:
+        os.makedirs(os.path.dirname(_LX_ALT_META_PATH) or ".", exist_ok=True)
+        tmp = f"{_LX_ALT_META_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"savedAt": int(time.time()), "items": _LX_ALT_META_CACHE}, f, ensure_ascii=False)
+        os.replace(tmp, _LX_ALT_META_PATH)
+    except Exception as e:
+        logger.debug("lx alt meta save failed: %s", e)
+
+
+def _lx_alt_meta_for(guid: str) -> dict:
+    _load_lx_alt_meta()
+    return dict(_LX_ALT_META_CACHE.get(song_id_from_online_guid(guid)) or {})
+
+
+def _load_ceru_lx_items() -> None:
+    global _CERU_LX_ITEM_LOADED
+    if _CERU_LX_ITEM_LOADED:
+        return
+    _CERU_LX_ITEM_LOADED = True
+    try:
+        with open(_CERU_LX_ITEM_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items") if isinstance(data, dict) else None
+        if isinstance(items, dict):
+            _CERU_LX_ITEM_CACHE.update({k: v for k, v in items.items() if isinstance(v, dict)})
+    except Exception:
+        pass
+
+
+def _save_ceru_lx_items(force: bool = False) -> None:
+    global _CERU_LX_ITEM_SAVE_LAST
+    now = time.monotonic()
+    if not force and now - _CERU_LX_ITEM_SAVE_LAST < 5.0:
+        return
+    _CERU_LX_ITEM_SAVE_LAST = now
+    try:
+        os.makedirs(os.path.dirname(_CERU_LX_ITEM_PATH) or ".", exist_ok=True)
+        tmp = f"{_CERU_LX_ITEM_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"savedAt": int(time.time()), "items": _CERU_LX_ITEM_CACHE}, f, ensure_ascii=False)
+        os.replace(tmp, _CERU_LX_ITEM_PATH)
+    except Exception as e:
+        logger.debug("ceru lx item cache save failed: %s", e)
+
+
+def _ceru_cached_lx_item(song: dict) -> dict:
+    _load_ceru_lx_items()
+    return dict(_CERU_LX_ITEM_CACHE.get(ceru.song_track_key(song)) or {})
+
+
+def _ceru_store_lx_item(song: dict, item: dict) -> None:
+    if not item or not item.get("id"):
+        return
+    _CERU_LX_ITEM_CACHE[ceru.song_track_key(song)] = dict(item)
+    _save_ceru_lx_items()
+
+
+def _ceru_forget_lx_item(song: dict) -> None:
+    """丢弃校验不通过的旧映射（同歌手的另一首歌曾被错误缓存）。"""
+    key = ceru.song_track_key(song)
+    if _CERU_LX_ITEM_CACHE.pop(key, None) is not None:
+        _save_ceru_lx_items()
+
+
+def _ceru_resolve_item_for_song(song: dict) -> dict:
+    """直连映射优先，其次使用通过一致性校验的持久化缓存。"""
+    item = _ceru_item_for_song(song)
+    if item and item.get("id"):
+        return item
+    cached = _ceru_cached_lx_item(song)
+    if cached and cached.get("id"):
+        if _ceru_item_matches_song(cached, song):
+            return cached
+        # 实测出现过“你怕啥子嘛”被缓存成同歌手的“我跪佛前问半生”。
+        _ceru_forget_lx_item(song)
+    return {}
+
+
+def _lx_url_probe_ok(song_id: str, url: str) -> bool:
+    """该直链是否被预取裸探测验证过（同 URL + direct + 新鲜窗口内）。"""
+    if not song_id or not url:
+        return False
+    entry = _LX_URL_PROBE.get(song_id)
+    if not entry:
+        return False
+    cached_url, ts, status = entry
+    if status != "direct" or cached_url != url:
+        return False
+    return time.time() - ts < _LX_PROBE_FRESH_S
+
+
+def _lx_prefetch_fresh(song_id: str) -> bool:
+    """该曲是否可跳过预取：缓存里的链已被裸探测验证为可直接播且仍新鲜。"""
+    entry = _LX_URL_PROBE.get(song_id or "")
+    if not entry:
+        return False
+    cached = _LX_URL_CACHE.get(song_id)
+    url = str((cached[0] or {}).get("url") or "") if cached else ""
+    return (entry[2] == "direct" and bool(url) and entry[0] == url
+            and time.time() - entry[1] < _LX_PROBE_FRESH_S)
+
+
+def _prune_lx_probe_table() -> None:
+    now = time.time()
+    for key in [k for k, (_, ts, _) in _LX_URL_PROBE.items()
+                if now - ts > _LX_PROBE_FRESH_S * 4]:
+        _LX_URL_PROBE.pop(key, None)
+
+
+def _lx_prefetch_mark_dead(song_id: str, url: str) -> None:
+    """预取探测发现死链：只记死链 + 清 URL 缓存（下次取链走全新解析），
+    不计流失败——预取探测 4xx 不等于真实断流，不触发音质降档。"""
+    if not song_id or not url:
+        return
+    _LX_DEAD_URLS.setdefault(song_id, {})[url] = time.time()
+    _LX_URL_CACHE.pop(song_id, None)
+
+
+async def _prefetch_probe_verify(song_id: str, url: str,
+                                 headers: "dict | None" = None) -> None:
+    """预取后按手机口径裸请求验证直链并分级记录（只打 CDN，不消耗用户源配额）。
+
+    - 裸 200/206 音频 → direct：播放主路径跳过 inline 探测直接 307；
+    - 裸 404 → dead：链已失效，记死链，由调用方后台重取；
+    - 裸 403/其他 4xx → 带源请求头复验，区分防盗链与死链：
+      带头成功 → relay（链活着，手机需走中转）；带头 4xx → dead；
+    - 超时/网络异常 → unknown：不动缓存，等下一轮再验。
+    """
+    if not song_id or not url or not CONF.get("wan_direct_enabled"):
+        return
+    if _lx_url_probe_ok(song_id, url):
+        return
+    if song_id in _LX_PROBE_VERIFYING:
+        return
+    _LX_PROBE_VERIFYING.add(song_id)
+    try:
+        if len(_LX_URL_PROBE) > 2000:
+            _prune_lx_probe_table()
+        ok, detail = await _wan_direct_probe(url, "bytes=0-1")
+        now = time.time()
+        if ok:
+            _LX_URL_PROBE[song_id] = (url, now, "direct")
+            return
+        if detail.startswith("status=404"):
+            status = "dead"
+        elif detail.startswith("status=4"):
+            ok2, detail2 = await _wan_direct_probe(url, "bytes=0-1",
+                                                    headers=headers or None)
+            if ok2:
+                status = "relay"
+            elif detail2.startswith("status=4"):
+                status = "dead"
+            else:
+                status = "unknown"
+        else:
+            status = "unknown"
+        _LX_URL_PROBE[song_id] = (url, now, status)
+        if status == "dead":
+            logger.info("lx prefetch probe dead url for %s (%s)", song_id, detail)
+            _lx_prefetch_mark_dead(song_id, url)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("lx prefetch probe failed for %s: %s", song_id, e)
+    finally:
+        _LX_PROBE_VERIFYING.discard(song_id)
+
+
+async def _prefetch_lx_urls(song_ids: list[str]) -> None:
+    sem = asyncio.Semaphore(2)
+
+    async def one(song_id: str) -> None:
+        if not song_id:
+            return
+        try:
+            async with sem:
+                resolved = await resolve_lx_url(get_lx_client(app), song_id, background=True)
+                url = str((resolved or {}).get("url") or "")
+                headers = (resolved or {}).get("headers") or {}
+                if not url:
+                    # 取链没排上（队列退避/冷却）：验证缓存里已有的链。
+                    # 复验只打 CDN 不烧配额——长收听会话里链接保鲜就靠这一环。
+                    cached = _LX_URL_CACHE.get(song_id)
+                    if cached:
+                        url = str((cached[0] or {}).get("url") or "")
+                        headers = (cached[0] or {}).get("headers") or {}
+                if url:
+                    await _prefetch_probe_verify(song_id, url, headers)
+                    if _LX_URL_PROBE.get(song_id, ("", 0.0, ""))[2] == "dead":
+                        # 死链确认：后台重取 + 再验一轮（只一轮，不循环烧配额）
+                        retry = await resolve_lx_url(get_lx_client(app), song_id, background=True)
+                        retry_url = str((retry or {}).get("url") or "")
+                        if retry_url:
+                            await _prefetch_probe_verify(
+                                song_id, retry_url, (retry or {}).get("headers") or {})
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _LX_PREFETCH_RUNNING.discard(song_id)
+
+    try:
+        await asyncio.gather(*(one(song_id) for song_id in song_ids), return_exceptions=True)
+    finally:
+        for song_id in song_ids:
+            _LX_PREFETCH_RUNNING.discard(song_id)
+
+
+# TOP[top.lx.prefetch] 播放地址后台预取 + 下一曲预热（压低首播延迟）
+def schedule_lx_prefetch(song_ids: list[str]) -> None:
+    pending: list[str] = []
+    for song_id in song_ids:
+        if not song_id or song_id in _LX_PREFETCH_RUNNING or _lx_prefetch_fresh(song_id):
+            continue
+        _LX_PREFETCH_RUNNING.add(song_id)
+        pending.append(song_id)
+    if not pending:
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(_prefetch_lx_urls(pending))
+    except RuntimeError:
+        return
+    _LX_PREFETCH_TASKS.add(task)
+    task.add_done_callback(_LX_PREFETCH_TASKS.discard)
+
+
+def _remember_ceru_page(tracks: list[dict]) -> None:
+    """记住最近下发的歌单页顺序，供“预取下一首”推断使用。"""
+    global _CERU_LAST_PAGE_GUIDS, _CERU_PAGE_INDEX
+    guids = [
+        str(t.get("guid") or "")
+        for t in tracks
+        if str(t.get("guid") or "").startswith("online:lx:")
+    ]
+    if len(guids) < 2:
+        return
+    _CERU_LAST_PAGE_GUIDS = guids
+    _CERU_PAGE_INDEX = {g: i for i, g in enumerate(guids)}
+
+
+def _schedule_next_track_prefetch(guid: str, request: "Request | None" = None) -> None:
+    """播放当前首时预热页内后续几首的直链，让切歌尽量命中已解析 URL。
+
+    窗口取 3 首（安卓版也是提前解析播放队列里的后几首）：真实听歌同一时刻只有
+    1-2 首要取链，队列几乎是空的，切歌直接命中缓存 → 起播接近秒开，也不会出现
+    "按下下一首才开始排队" 的尾部超时。预取一律带后台标记，服务端忙时先甩它，
+    绝不占用用户正在等的这一首。
+    """
+    idx = _CERU_PAGE_INDEX.get(str(guid or ""))
+    if idx is None:
+        return
+    now = time.time()
+    pending: list[str] = []
+    for next_guid in _CERU_LAST_PAGE_GUIDS[idx + 1: idx + 1 + _CERU_PREFETCH_WINDOW]:
+        if now < _CERU_PREFETCH_AT.get(next_guid, 0.0):
+            continue
+        song_id = song_id_from_online_guid(next_guid)
+        if not song_id:
+            continue
+        _CERU_PREFETCH_AT[next_guid] = now + _CERU_PREFETCH_COOLDOWN_S
+        pending.append(song_id)
+    if pending:
+        schedule_lx_prefetch(pending)
+    # 2.6.54：预取只负责"取好直链"，预开再进一步——把紧邻下一首的流真正打开
+    # （连上 CDN 并取到首包）。命中时切歌首包零等待；失败静默回落，不碰成功率。
+    if request is not None and idx + 1 < len(_CERU_LAST_PAGE_GUIDS):
+        try:
+            asyncio.create_task(_preopen_next_track(request, _CERU_LAST_PAGE_GUIDS[idx + 1]))
+        except RuntimeError:
+            pass
+
+
+def _remember_list_order(payload: "dict | None") -> None:
+    """记住列表 payload 里在线曲目的顺序，供“预取下一首”推断。
+
+    2.6.53：从 Ceru 歌单页扩到所有列表下发点（搜索/收藏/歌单页/专辑详情）。
+    只认标准单列表形态 data.list / data.tracks；假 guid 统一反解回真实 guid；
+    在线曲目不足 2 条不做（预取窗口需要至少两首才有“下一首”）。
+    """
+    if not isinstance(payload, dict):
+        return
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return
+    tracks = data.get("list")
+    if not isinstance(tracks, list):
+        tracks = data.get("tracks")
+    if not isinstance(tracks, list):
+        return
+    guids: list[str] = []
+    seen: set[str] = set()
+    for t in tracks:
+        if not isinstance(t, dict):
+            continue
+        g = resolve_real_guid(str(t.get("guid") or ""))
+        if g.startswith("online:") and g not in seen:
+            seen.add(g)
+            guids.append(g)
+    if len(guids) < 2:
+        return
+    _remember_ceru_page([{"guid": g} for g in guids])
+
+
+def _warm_page_head(tracks: "list | None", limit: int = 1) -> None:
+    """打开列表页时预热页首 N 首在线曲（与既有 Ceru 歌单页同口径）：
+    用一次后台额度换首播接近秒开；预取带后台标记，不挤占用户请求。
+    """
+    ids: list[str] = []
+    for t in tracks or []:
+        if not isinstance(t, dict):
+            continue
+        g = str(t.get("guid") or "") or online_guid_from_item(t)
+        g = resolve_real_guid(g)
+        if g.startswith("online:lx:") and len(ids) < limit:
+            sid = song_id_from_online_guid(g)
+            if sid and sid not in ids:
+                ids.append(sid)
+        if len(ids) >= limit:
+            break
+    if ids:
+        schedule_lx_prefetch(ids)
+
+
+# TOP[top.quality] 音质偏好（高音质/平衡/流畅）对质量梯的排序规则
 def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", primary: "str | None" = None) -> list[str]:
     """按音质模式排档序（ladder 从低到高）。
 
@@ -2086,34 +2741,166 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
-    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
-    primary = str(CONF.get("lx_quality") or "lossless").strip()
-    qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities:
-        qualities.insert(0, primary)
+async def _lx_ladder_resolve(client: httpx.AsyncClient, song_id: str,
+                             qualities: list, *, fresh: bool,
+                             background: bool = False) -> "dict | None":
+    """按档序逐档向 lxmusic-service 取链；fresh=1 时强制服务端跳过探活缓存。
 
-    for q in qualities:
+    background=True 表示预取/预热这类「用户没在等」的取链：服务端会把它排到
+    播放请求之后，队列积压时优先甩它。
+    """
+    global _LX_QUEUE_BACKOFF_UNTIL
+    headers = {_BG_HEADER: "1"} if background else {}
+
+    async def _attempt(q: str) -> tuple[str, "dict | None"]:
+        """一档一枪：ok=拿到直链，busy=服务端排队已满，miss=这一档没货。"""
+        params = {"id": song_id, "quality": q}
+        if fresh:
+            params["fresh"] = 1
         try:
             r = await client.get(
                 "/api/v1/track/url",
-                params={"id": song_id, "quality": q},
+                params=params,
+                headers=headers,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
                 timeout=22.0,
             )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict) and data.get("ok") is not False:
-                    inner = data.get("data")
-                    if isinstance(inner, dict) and inner.get("url"):
-                        return inner
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
+            return "miss", None
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:  # noqa: BLE001
+                return "miss", None
+            if isinstance(data, dict) and data.get("ok") is not False:
+                inner = data.get("data")
+                if isinstance(inner, dict) and inner.get("url"):
+                    return "ok", inner
+            return "miss", None
+        if r.status_code == 503:
+            return "busy", None
+        # 洛雪用户源限流时后续档位也一定失败，立即停止并让上层换源/稍后重试，
+        # 不再用 lossless→high→standard 连续撞三次把限流窗口打得更久。
+        try:
+            err_text = str((r.json() or {}).get("error") or "")
+        except Exception:  # noqa: BLE001
+            err_text = ""
+        low = err_text.lower()
+        if any(marker in low for marker in _LX_UPSTREAM_FAULT_MARKERS):
+            logger.warning("lx rate limited for %s: %s", song_id, err_text)
+            plat = _lx_platform_of(song_id)
+            if plat:
+                _LX_PLATFORM_COOLDOWN[plat] = time.time() + _LX_PLATFORM_COOLDOWN_S
+            return "miss", None
+        return "miss", None
+
+    for q in qualities:
+        if _lx_platform_cooled(song_id):
+            break
+        kind, data = await _attempt(q)
+        if kind == "ok":
+            return data
+        if kind == "busy":
+            # 队列满不是无货：等一轮再补一枪（队列浅时基本就过了）。
+            await asyncio.sleep(_LX_QUEUE_RETRY_DELAY_S)
+            kind2, data2 = await _attempt(q)
+            if kind2 == "ok":
+                return data2
+            # 仍满：打开全局短时退避，让所有在途/后续取链一起收手，
+            # 否则「秒失败→立刻重试」会把队列彻底打爆。
+            _LX_QUEUE_BACKOFF_UNTIL = time.time() + _LX_QUEUE_BACKOFF_S
+            logger.info("lx resolve queue still full for %s (quality=%s), backoff %.1fs",
+                        song_id, q, _LX_QUEUE_BACKOFF_S)
+            return None
+    return None
+
+
+# TOP[top.stream.resolve] 洛雪播放地址解析：质量梯选择、死链降档、失败冷却
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, *,
+                         background: bool = False) -> "dict | None":
+    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
+    global _LX_QUEUE_BACKOFF_UNTIL
+    original_id = str(song_id or "")
+    if time.time() < _LX_QUEUE_BACKOFF_UNTIL:
+        # 全局取链退避窗口内不再撞队列（预取/预热/候选重试都在这一层收手）
+        return None
+    cached_hit = _LX_URL_CACHE.get(original_id)
+    if cached_hit and time.time() - cached_hit[1] < _LX_URL_CACHE_TTL_S:
+        # 2.6.39：缓存里那条链已被确认失效（死链排除，对齐安卓 failedUrls）→ 作废重取
+        if str((cached_hit[0] or {}).get("url") or "") in _lx_dead_urls(original_id):
+            _LX_URL_CACHE.pop(original_id, None)
+        else:
+            return dict(cached_hit[0])
+    alt = _LX_ALT_CACHE.get(original_id)
+    if alt and time.time() - alt[1] < _LX_ALT_CACHE_TTL_S:
+        try:
+            alt_resolved = await resolve_lx_url(client, alt[0], background=background)
+        except Exception:
+            alt_resolved = None
+        if alt_resolved:
+            _LX_URL_CACHE[original_id] = (dict(alt_resolved), time.time())
+            return alt_resolved
+
+    # 冷却检查必须放在“替代源尝试”之后：原平台挂了/原曲目刚失败过，
+    # 不代表缓存里的替代曲目（另一个平台）也不可用。此前冷却在最前面，
+    # 会把 alt 自救和 URL 缓存之后唯一的活路一起堵死，转码拿不到源就只能
+    # 发 App 不认的假列表 → 拒收 → 跳歌 → 连环啪啪跳。
+    if time.time() < _LX_FAIL_COOLDOWN.get(original_id, 0.0):
+        return None
+    if _lx_platform_cooled(song_id):
+        return None
+
+    # 对齐桌面端 getPlaybackQualityCandidates：一个音质档失败后逐档重试，
+    # 而不是一次失败就让客户端跳歌。档序由管理页「音质偏好」决定：
+    # 高音质=lossless(flac) 优先，失败降 high(320k) 再降 standard(128k)；
+    # 平衡=320k 优先；流畅=128k 优先（128k 请求最省额度、CDN 最稳）。
+    # 若失败原因是上游网关故障（循环内会打开平台冷却并立即中止），
+    # 不去白烧剩余额度。
+    # 2.6.39：该曲直链有失效记录时从更低档起步（对齐安卓播放报错→降档回退）。
+    qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"),
+                              CONF.get("lx_quality"))
+    steps = _lx_tier_downgrade_steps(original_id)
+    if steps > 0 and len(qualities) > 1:
+        qualities = qualities[steps:] + qualities[:steps]
+
+    resolved = await _lx_ladder_resolve(client, song_id, qualities, fresh=False,
+                                        background=background)
+    if resolved and str(resolved.get("url") or "") in _lx_dead_urls(original_id):
+        # 服务端探活缓存仍在下发同一死链：fresh=1 强制重解析一次
+        #（等价安卓把 failedUrls 排除后重新取链）。
+        logger.info("lx dead url still served upstream for %s, fresh re-resolve", original_id)
+        fresh2 = await _lx_ladder_resolve(client, song_id, qualities, fresh=True,
+                                          background=background)
+        if fresh2 and str(fresh2.get("url") or "") not in _lx_dead_urls(original_id):
+            resolved = fresh2
+        else:
+            # 强制重解析仍拿不到活链：本轮判失败进冷却，绝不把死链写回缓存
+            # （否则每轮首播都要白烧两次取链才拿回同一条死链）。
+            resolved = None
+    if resolved:
+        _LX_URL_CACHE[original_id] = (dict(resolved), time.time())
+        _LX_FAIL_COOLDOWN.pop(original_id, None)
+        _lx_health_report(original_id, True)
+        _lx_reset_stream_fails(original_id)
+        return resolved
+    if time.time() < _LX_QUEUE_BACKOFF_UNTIL:
+        # 排队没排上不是这首歌无货：只按退避窗口收手，既不写 15s 单曲冷却，
+        # 也不给平台记失败（否则一次拥塞会把同平台后续歌曲全部误杀）。
+        return None
+    _LX_FAIL_COOLDOWN[original_id] = time.time() + _LX_FAIL_COOLDOWN_S
+    _lx_health_report(original_id, False)
     return None
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
+    original_id = str(song_id or "")
+    cache_key = (id(client), original_id)
+    cached_hit = _NETEASE_URL_CACHE.get(cache_key)
+    if cached_hit and time.time() - cached_hit[1] < _NETEASE_URL_CACHE_TTL_S:
+        return cached_hit[0]
+
     primary = str(CONF.get("netease_quality") or "lossless").strip()
     qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2121,7 +2908,7 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
 
     for q in qualities:
         try:
-            r = await client.get(f"/api/v1/song/{song_id}/url", params={"quality": q}, timeout=10.0)
+            r = await client.get(f"/api/v1/song/{original_id}/url", params={"quality": q}, timeout=10.0)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict) and data.get("ok") is not False:
@@ -2130,7 +2917,9 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
                         code = inner.get("code")
                         url = inner.get("url")
                         if code == 200 and url:
-                            return str(url)
+                            url = str(url)
+                            _NETEASE_URL_CACHE[cache_key] = (url, time.time())
+                            return url
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
     return None
@@ -2224,6 +3013,7 @@ _REGISTRY_WARMED = False
 _ONLINE_ID_RE = re.compile(r"online:[A-Za-z0-9_:\-]+")
 
 
+# TOP[top.guid] 在线 guid 伪装/反查：客户端只见 32 位官方 id，服务端保持注册表
 def fake_official_guid(real_guid: str) -> str:
     """在线 guid 确定性映射为官方 32-hex 形态。
 
@@ -2519,6 +3309,19 @@ def ensure_registry_warm() -> None:
     if _REGISTRY_WARMED:
         return
     _REGISTRY_WARMED = True
+    try:
+        for guid in ceru.registered_guids():
+            if is_online_guid(guid):
+                for suffix in (
+                    "", ":album", ":artist",
+                    ":cover2", ":album:cover2", ":artist:cover2",
+                    ":cover3", ":album:cover3", ":artist:cover3",
+                    ":cover4", ":album:cover4", ":artist:cover4",
+                    ":cover5", ":album:cover5", ":artist:cover5",
+                ):
+                    fake_official_guid(f"{guid}{suffix}")
+    except Exception as e:
+        logger.debug("ceru guid registry warm failed: %s", e)
     for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
                       CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks"),
                       dailyrec.play_history_dir(),
@@ -2669,6 +3472,7 @@ def stub_online_info(guid: str) -> dict:
     }
 
 
+# TOP[top.metadata] 播放页元数据组装：isFavorite/coverId 与列表同口径（防星标闪/封面闪）
 def build_metadata_payload(guid: str, data: dict | None) -> dict:
     """飞牛 resolveTrackPlayback._h() 会无防护读取 data.track.genres.join / album / artists。
 
@@ -2729,6 +3533,101 @@ def _background_jobs_enabled() -> bool:
     return os.environ.get("FNMUSIC_BACKGROUND_JOBS", "").lower() in ("1", "true", "yes")
 
 
+_LAST_PLAY_AT = 0.0
+
+# === 收藏封面/歌词全量补齐（限速、可续跑、补完即静默）===
+# 缺什么补什么：已有封面磁盘缓存 / 已有 .lrc 的直接跳过，所以跑完一轮之后
+# 每轮都接近零请求。官方接口额度仍由既有每日预算卡住（跨源搜索 600/天、
+# 酷我按 ID 500/天），这里只按节奏喂，不会持续打接口；正在播放时自动避让。
+_ASSET_SWEEP_ENABLED = os.environ.get("FNMUSIC_ASSET_SWEEP", "1").lower() in ("1", "true", "yes")
+_ASSET_SWEEP_START_DELAY_S = float(os.environ.get("FNMUSIC_ASSET_SWEEP_DELAY", "75"))
+_ASSET_SWEEP_GAP_S = float(os.environ.get("FNMUSIC_ASSET_SWEEP_GAP", "0.9"))
+_ASSET_SWEEP_PLAY_AVOID_S = float(os.environ.get("FNMUSIC_ASSET_SWEEP_AVOID", "25"))
+_ASSET_SWEEP_RESCAN_S = float(os.environ.get("FNMUSIC_ASSET_SWEEP_RESCAN", "21600"))
+
+
+def _asset_sweep_state_path() -> str:
+    return os.path.join(CONF.get("cache_dir") or _HOME, "asset_sweep.json")
+
+
+def _background_request() -> "Request":
+    """后台任务用的最小 Request：只需要 app / headers / query 这三样。"""
+    scope = {
+        "type": "http", "http_version": "1.1", "method": "GET", "path": "/internal",
+        "raw_path": b"/internal", "query_string": b"", "root_path": "", "scheme": "http",
+        "headers": [(b"host", b"127.0.0.1")], "client": ("127.0.0.1", 0),
+        "server": ("127.0.0.1", 0), "app": app,
+    }
+    return Request(scope)
+
+
+async def _asset_sweeper() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_ASSET_SWEEP_START_DELAY_S)
+            state_path = _asset_sweep_state_path()
+            state: dict = {}
+            try:
+                state = json.loads(open(state_path, encoding="utf-8").read()) or {}
+            except Exception:  # noqa: BLE001
+                state = {}
+            index = await _ceru_favorites_index()
+            songs = [s for s in (index.get("by_key") or {}).values() if isinstance(s, dict)]
+            if not songs:
+                await asyncio.sleep(120)
+                continue
+            cursor = int(state.get("cursor") or 0)
+            if cursor >= len(songs):
+                # 这一轮全查过了：只在真正过了复扫间隔后才从头再来（增量补齐新歌）
+                if time.time() - float(state.get("finishedAt") or 0.0) < _ASSET_SWEEP_RESCAN_S:
+                    await asyncio.sleep(300)
+                    continue
+                cursor = 0
+            request = _background_request()
+            filled = 0
+            for pos in range(cursor, len(songs)):
+                if time.time() - _LAST_PLAY_AT < _ASSET_SWEEP_PLAY_AVOID_S:
+                    await asyncio.sleep(_ASSET_SWEEP_PLAY_AVOID_S)  # 用户在听：让路
+                song = songs[pos]
+                try:
+                    track = _ceru_light_track(song)
+                except Exception:  # noqa: BLE001
+                    track = None
+                guid = str((track or {}).get("guid") or "")
+                pos_next = pos + 1
+                if not guid.startswith("online:lx:"):
+                    continue
+                need_cover = _read_cover_cache(guid) is None
+                need_lyric = not read_lyric_cache(guid)
+                if need_cover or need_lyric:
+                    _preheat_track_assets(request, guid)
+                    filled += 1
+                    await asyncio.sleep(_ASSET_SWEEP_GAP_S)
+                if pos_next % 25 == 0:
+                    state.update({"cursor": pos_next, "updatedAt": int(time.time())})
+                    try:
+                        tmp = f"{state_path}.tmp"
+                        with open(tmp, "w", encoding="utf-8") as fh:
+                            json.dump(state, fh)
+                        os.replace(tmp, state_path)
+                    except OSError:
+                        pass
+            state.update({"cursor": len(songs), "finishedAt": int(time.time())})
+            try:
+                tmp = f"{state_path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(state, fh)
+                os.replace(tmp, state_path)
+            except OSError:
+                pass
+            logger.info("收藏封面/歌词补齐扫描完成一轮：%d 首入队补齐，共 %d 首", filled, len(songs))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("asset sweeper failed: %s", e)
+            await asyncio.sleep(600)
+
+
 async def _lyric_orphan_sweeper() -> None:
     """启动即清一次、之后每 30 分钟复扫：清掉本插件写进曲库、音频已消失的孤儿
     .lrc（安全边界见 cache_gc.sweep_orphan_lyrics，用户自有歌词永不触碰）。
@@ -2750,7 +3649,9 @@ async def _lyric_orphan_sweeper() -> None:
 
 
 @asynccontextmanager
+# TOP[top.proxy] 代理进程生命周期：启动自检、env 热重载循环、后台清扫任务
 async def lifespan(fastapi_app: FastAPI):
+    global _PROBE_CLIENT
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
@@ -2758,8 +3659,14 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("==================================")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
+    asset_task = asyncio.create_task(_asset_sweeper()) if (
+        _background_jobs_enabled() and _ASSET_SWEEP_ENABLED
+    ) else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
+    ) else None
+    ceru_task = asyncio.create_task(ceru.sync_poll_loop()) if (
+        _background_jobs_enabled() and _ceru_on()
     ) else None
     created_upstream = False
     created_musicdl = False
@@ -2811,9 +3718,16 @@ async def lifespan(fastapi_app: FastAPI):
         if sweeper_task:
             sweeper_task.cancel()
             await asyncio.gather(sweeper_task, return_exceptions=True)
+        if asset_task:
+            asset_task.cancel()
+            await asyncio.gather(asset_task, return_exceptions=True)
         if env_task:
             env_task.cancel()
             await asyncio.gather(env_task, return_exceptions=True)
+        if ceru_task:
+            ceru_task.cancel()
+            await asyncio.gather(ceru_task, return_exceptions=True)
+        await ceru.close()
         try:
             await tc.shutdown_all()
         except Exception:  # noqa: BLE001
@@ -2830,6 +3744,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_lx and getattr(fastapi_app.state, "lx_client", None):
             await fastapi_app.state.lx_client.aclose()
             fastapi_app.state.lx_client = None
+        if _PROBE_CLIENT is not None and not _PROBE_CLIENT.is_closed:
+            await _PROBE_CLIENT.aclose()
+        _PROBE_CLIENT = None
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
@@ -2854,6 +3771,24 @@ async def log_client_requests(request: Request, call_next):
             response.status_code,
             ua,
         )
+    return response
+
+
+@app.middleware("http")
+async def no_store_dynamic_api(request: Request, call_next):
+    """动态 API 响应统一 no-store。
+
+    飞牛远程访问网关（以及任何中间层/客户端 HTTP 缓存）对没有 Cache-Control
+    的 GET 响应可能按默认策略缓存：升级后内网直连拿新数据、外网拿旧缓存，
+    表现为同一歌单内外网显示不一致（如标星/曲目变化不生效）。音频流与封面
+    响应均已显式设置缓存头，不受影响。"""
+    response = await call_next(request)
+    if (
+        request.method == "GET"
+        and request.url.path.startswith("/music/api/v1/")
+        and "cache-control" not in response.headers
+    ):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -2909,8 +3844,36 @@ async def ext_healthz(request: Request):
             "degraded": bool(failed), "failures": failed, "details": details}
 
 
+@app.get("/_ext/ceru/status")
+# TOP[top.ceru.status] 多端同步状态接口（WebUI 同步页数据源）
+async def ext_ceru_status():
+    """Ceru 同步接入自检（Unix socket 可直接 curl，供排障确认数据已拉取）。"""
+    enabled_flag = bool(CONF.get("ceru_sync_enabled"))
+    if not _ceru_on():
+        return {
+            "ok": False,
+            "enabled": enabled_flag,
+            "host": CONF.get("ceru_sync_host") or "",
+            "reason": "ceru sync not enabled or host not configured",
+        }
+    try:
+        playlists = await ceru.list_playlists()
+        favorites = await ceru.list_favorites()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "enabled": True, "error": str(exc)}
+    return {
+        "ok": True,
+        "enabled": True,
+        "host": CONF.get("ceru_sync_host") or "",
+        "playlists": len(playlists),
+        "favorites": len(favorites.get("song") or []),
+        "titles": [str(p.get("title") or "") for p in playlists[:8]],
+    }
+
+
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
+# TOP[top.search] 搜索聚合主入口：本地曲库优先 + 音源窗口分页 + 可播过滤
 async def search_track(request: Request):
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
@@ -3028,11 +3991,15 @@ async def search_track(request: Request):
     selected = _online_window(entry, page, size, original_total)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
+    logger.info("search debug: kw=%s page=%s size=%s official_total=%s online_items=%s online_total=%s final_total=%s",
+                keyword, page, size, original_total, len(entry["items"]), total_online, merged["data"]["total"])
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
             if isinstance(it, dict) and str(it.get("guid") or "") in fav_set:
                 it["isFavorite"] = True
+    _remember_list_order(merged)
+    _warm_page_head(selected)
     return JSONResponse(content=disguise_client_json(merged), status_code=upstream_resp.status_code, headers=resp_headers)
 
 
@@ -3484,6 +4451,7 @@ def _schedule_library_scan(headers: dict | None) -> None:
     _scan_task = asyncio.create_task(_run())
 
 
+# TOP[top.tee] 边听边存：Tee 落盘、收尾入库、封面内嵌、自动下载歌词
 def stream_tee_response(
     resp: httpx.Response,
     guid: str,
@@ -3496,8 +4464,12 @@ def stream_tee_response(
     first_chunk: bytes = b"",
     scan_headers_factory: Callable[[], dict] | None = None,
     post_finalize: Callable[[dict | None], Coroutine[Any, Any, None]] | None = None,
+    reconnect: Callable[[int], Coroutine[Any, Any, tuple[httpx.Response, Any, bytes] | None]] | None = None,
+    on_death: Callable[[], None] | None = None,
 ) -> Response:
     headers = {"Accept-Ranges": "bytes"}
+    # 禁止前置 nginx 缓冲音频分片，避免外网播放首包被延迟到缓冲填满后才发出。
+    headers["X-Accel-Buffering"] = "no"
     for key in ("content-type", "content-length", "content-range"):
         if resp.headers.get(key):
             headers[key] = resp.headers[key]
@@ -3526,8 +4498,16 @@ def stream_tee_response(
         info_task = None
         tee_active_token = False
         upstream_aborted = False
+        # 必须在 try 之前绑定：finally 会引用这两个变量，若首次赋值放在 try 内，
+        # 一旦生成器在赋值前被关闭（客户端提前断开/换源重定向），finally 就会
+        # 抛 UnboundLocalError，把正常音频流直接打断。
+        tee_enabled = bool(CONF.get("tee_save_enabled"))
+        resume_part = None
+        # 不能用 resp 这个名字在本函数内赋值：一旦赋值，Python 会把 resp 视为
+        # body() 的局部变量，收尾时 await resp.aclose() 就会 UnboundLocalError，
+        # 把正常音频流中途掐断（浏览器表现为播不了/播一半停）。
+        current_resp = resp
         try:
-            tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
                 directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
                 os.makedirs(directory, exist_ok=True)
@@ -3542,13 +4522,54 @@ def stream_tee_response(
                     fp.write(first_chunk)
                 written += len(first_chunk)
                 yield first_chunk
+            reconnect_attempts = 0
             try:
-                async for chunk in iterator:
-                    if chunk:
-                        if fp:
-                            fp.write(chunk)
-                        written += len(chunk)
-                        yield chunk
+                while True:
+                    try:
+                        async for chunk in iterator:
+                            if chunk:
+                                if fp:
+                                    fp.write(chunk)
+                                written += len(chunk)
+                                yield chunk
+                        break
+                    except Exception as exc:
+                        # CDN 中途掉线：从已写入位置 Range 续传，继续同一个
+                        # 客户端响应。只有“无法续传/续传又失败”才把这条直链
+                        # 记为失效（对齐安卓 failedUrls）；续传成功不算流失败，
+                        # 避免一次瞬时抖动把整档音质拖低。
+                        if on_death and (reconnect is None
+                                         or reconnect_attempts >= 3 or written <= 0):
+                            on_death()
+                        if reconnect is None or reconnect_attempts >= 3 or written <= 0:
+                            raise
+                        reconnect_attempts += 1
+                        logger.warning(
+                            "Stream interrupted for %s at %d bytes, reconnecting (%d/3): %s",
+                            guid, written, reconnect_attempts, type(exc).__name__,
+                        )
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                await resp.aclose()
+                            except Exception:
+                                pass
+                        try:
+                            resumed = await reconnect(written)
+                        except Exception:
+                            if on_death:
+                                on_death()
+                            raise
+                        if resumed is None:
+                            if on_death:
+                                on_death()
+                            raise
+                        new_resp, iterator, first = resumed
+                        current_resp = new_resp
+                        if first:
+                            if fp:
+                                fp.write(first)
+                            written += len(first)
+                            yield first
             except Exception as exc:
                 # An aborted stream must not enter the cache, but it must leave
                 # a trace: CDN stalls mid-file were previously invisible in the
@@ -3596,7 +4617,6 @@ def stream_tee_response(
             if fp:
                 fp.close()
                 fp = None
-            resume_part = None
             if part and os.path.exists(part):
                 # 切歌/客户端退出不中断下载：未写完的 part 交接给后台续传任务完成
                 # （仅边听边存开启的整轨流且非上游错误；written 不足或续传满载时
@@ -3617,7 +4637,10 @@ def stream_tee_response(
                 if info_task and not info_task.done():
                     info_task.cancel()
                     await asyncio.gather(info_task, return_exceptions=True)
-                await resp.aclose()
+                try:
+                    await current_resp.aclose()
+                except Exception:
+                    pass
                 if client_to_close:
                     await client_to_close.aclose()
                 if resume_part:
@@ -3645,6 +4668,7 @@ def _retained_track(request: Request, guid: str) -> tuple[dict | None, dict | No
     return None, None
 
 
+# TOP[top.stream.fallback] 换源恢复：主源失败按健康度换替代源（无损黑名单防反复横跳）
 async def _recover_source(request: Request, guid: str, entry: dict | None) -> bool:
     """One bounded source re-search after a backend loses its in-memory IDs."""
     if not entry or not _source_enabled(guid):
@@ -3683,9 +4707,12 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
+# TOP[top.stream.open] 在线播放开流主链路：本地缓存 → 取址 → 直连/代理 → Tee
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
                               force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
+    global _LAST_PLAY_AT
+    _LAST_PLAY_AT = time.time()
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
@@ -3695,6 +4722,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     owned = None
     resp = None
     ext = None
+    reconnect_builder = None
+    on_death = None
     try:
         if source in ("netease", "lx"):
             if source == "netease":
@@ -3702,14 +4731,130 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                lx_client = get_lx_client(request.app)
+                try:
+                    resolved = await asyncio.wait_for(
+                        # lxmusic-service 内部预算 20s（含多源回退 + 降档 + 探活），
+                        # 这里给足 12s，避免解析已完成却被 proxy 提前判失败。
+                        resolve_lx_url(lx_client, song_id_from_online_guid(guid)), timeout=12.0
+                    )
+                except Exception:
+                    resolved = None
+                if not resolved:
+                    # 直接 ID 解析失败时，用标题+歌手在当前洛雪源重新搜索一个可播候选，
+                    # 减少“这首歌跳过”的概率。
+                    if info is None:
+                        try:
+                            info = await asyncio.wait_for(
+                                _fetch_online_info(request, guid, include_lyric=False), timeout=3.0
+                            )
+                        except Exception:
+                            info = None
+                    if not str((info or {}).get("title") or "").strip():
+                        ceru_song = ceru.song_for_guid(guid)
+                        if ceru_song:
+                            info = {
+                                **(info or {}),
+                                "title": ceru.song_title(ceru_song),
+                                "artist": ceru.song_artist(ceru_song),
+                                "album": ceru.song_album(ceru_song),
+                            }
+                    original_meta = _LX_ALT_META_CACHE.setdefault(song_id_from_online_guid(guid), {})
+                    for key in ("title", "artist", "album", "cover_url", "duration_s", "ext"):
+                        if info.get(key) not in (None, "") and not original_meta.get(key):
+                            original_meta[key] = info[key]
+                    if original_meta:
+                        _save_lx_alt_meta()
+                    title = str((info or {}).get("title") or "").strip()
+                    artist = str((info or {}).get("artist") or "").strip()
+                    keyword = f"{title} {artist}".strip()
+                    if keyword:
+                        try:
+                            candidates = await asyncio.wait_for(
+                                fetch_lx_search(lx_client, keyword, 12), timeout=8.0
+                            )
+                        except Exception:
+                            candidates = []
+                        # 优先标题一致、歌手匹配的候选，再逐个尝试解析
+                        norm = lambda s: re.sub(r"[\s\-—·・&/、,，|]", "", str(s or "")).lower()
+                        cand_title = norm(title)
+                        cand_artist = norm(artist)
+                        def cand_title_of(cand):
+                            return norm(cand.get("title") or cand.get("name"))
+                        def rank(cand):
+                            c_title = cand_title_of(cand)
+                            c_artist = norm(cand.get("artist") or cand.get("singer"))
+                            score = 0
+                            if cand_title and c_title == cand_title:
+                                score += 4
+                            elif cand_title and c_title and (cand_title in c_title or c_title in cand_title):
+                                score += 2
+                            if cand_artist and c_artist and (cand_artist == c_artist or cand_artist in c_artist or c_artist in cand_artist):
+                                score += 2
+                            score -= _lx_health_rank(str(cand.get("id") or ""))
+                            # 正在冷却的平台排到最后，优先用健康平台兜底。
+                            if _lx_platform_cooled(str(cand.get("id") or "")):
+                                score -= 10
+                            return -score
+                        pool = [c for c in (candidates or []) if isinstance(c, dict)]
+                        if cand_title:
+                            # 只接受标题一致的候选：搜索结果里经常混入同歌手的
+                            # 其它歌，直接取 top1 会把“你怕啥子嘛”播成别的歌。
+                            exact = [c for c in pool if cand_title_of(c) == cand_title]
+                            near = [
+                                c for c in pool
+                                if cand_title_of(c)
+                                and (cand_title in cand_title_of(c) or cand_title_of(c) in cand_title)
+                            ]
+                            pool = exact or near
+                        ranked = sorted(pool, key=rank)
+                        for cand in ranked[:5]:
+                            alt_id = str((cand or {}).get("id") or "")
+                            if not alt_id or alt_id == song_id_from_online_guid(guid):
+                                continue
+                            if _lx_platform_cooled(alt_id):
+                                continue
+                            try:
+                                alt = await asyncio.wait_for(resolve_lx_url(lx_client, alt_id), timeout=10.0)
+                            except Exception:
+                                alt = None
+                            if alt:
+                                resolved = alt
+                                alt_guid = online_guid_from_item(cand)
+                                if alt_guid and alt_guid != guid:
+                                    # 换源只换音频流，封面/歌词仍认原歌曲。
+                                    _CERU_SOURCE_OVERRIDES[alt_guid] = guid
+                                alt_meta = _LX_ALT_META_CACHE.setdefault(song_id_from_online_guid(guid), {})
+                                for key in ("title", "artist", "album", "cover_url", "duration_s", "ext"):
+                                    if cand.get(key) not in (None, "") and not alt_meta.get(key):
+                                        alt_meta[key] = cand.get(key)
+                                _save_lx_alt_meta()
+                                _LX_ALT_CACHE[song_id_from_online_guid(guid)] = (
+                                    alt_id, time.time()
+                                )
+                                break
                 if not resolved:
                     return None
                 url = resolved["url"]
+                # 2.6.39 断流死链回收（对齐安卓 failedUrls）：首字节取不到或
+                # 中途断流时把这条直链标记失效，下次取链自动跳过它。
+                # 默认参数绑定当前值，避免闭包延迟求值拿到后续赋值的 url。
+                def on_death(_s=song_id_from_online_guid(guid), _u=url) -> None:
+                    _lx_mark_url_dead(_s, _u)
                 ext = resolved.get("ext")
                 for key, value in (resolved.get("headers") or {}).items():
-                    if key.lower() in ("referer", "user-agent"):
+                    if key.lower() in ("referer", "user-agent", "origin", "cookie"):
                         headers[key] = str(value)
+                # 关键：CDN 防盗链。lxmusic-service 已用浏览器 UA 探活通过，
+                # 但响应不带 headers；proxy 直接取流会用 python-httpx UA 被
+                # 酷我等平台 403。缺什么补什么，已有则以源返回的为准。
+                if not any(k.lower() == "user-agent" for k in headers):
+                    headers["User-Agent"] = _MEDIA_UA
+                if not any(k.lower() == "referer" for k in headers):
+                    plat = _lx_platform_of(song_id_from_online_guid(guid))
+                    referer = _MEDIA_REFERER.get(plat)
+                    if referer:
+                        headers["Referer"] = referer
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
@@ -3725,6 +4870,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             )
             client = owned
             req = client.build_request("GET", url, headers=headers)
+            reconnect_builder = lambda h: client.build_request("GET", url, headers=h)
         else:
             client = get_musicdl_client(request.app)
             via_musicdl = True
@@ -3734,29 +4880,82 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
                 params["quality"] = "mp3"
             req = client.build_request("GET", "/stream", params=params, headers=headers)
+            reconnect_builder = lambda h: client.build_request("GET", "/stream", params=params, headers=h)
         resp = await client.send(req, stream=True)
+
+        async def reconnect(offset: int):
+            if offset <= 0:
+                return None
+            retry_headers = dict(headers)
+            retry_headers["Range"] = f"bytes={offset}-"
+            retry_req = None
+            # 洛雪续传只回原直链：Range 偏移按原编码的字节数算，重新解析拿到
+            # 的“另一条”链音质/编码可能不同，硬拼字节会把音频拼花。token 过期
+            # 导致原链 403 时这里返回 None → on_death 记死链，客户端重播时
+            # resolve_lx_url 走死链排除 + fresh=1 重新取链。
+            if source == "netease":
+                try:
+                    fresh_url = await resolve_netease_url(
+                        get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1]
+                    )
+                except Exception:
+                    fresh_url = None
+                if fresh_url:
+                    retry_req = client.build_request("GET", fresh_url, headers=retry_headers)
+            if retry_req is None:
+                if reconnect_builder is None:
+                    return None
+                retry_req = reconnect_builder(retry_headers)
+            retry_resp = await client.send(retry_req, stream=True)
+            ctype = retry_resp.headers.get("content-type", "").lower()
+            # 续传必须拿到 206 分段：200 表示服务端忽略 Range 从头下发，拼进
+            # 已播放的偏移只会把音频拼花，直接放弃。
+            if (retry_resp.status_code not in (200, 206)
+                    or (retry_resp.status_code == 200 and offset > 0)
+                    or any(x in ctype for x in ("text/", "json"))):
+                await retry_resp.aclose()
+                return None
+            retry_chunks = retry_resp.aiter_bytes()
+            retry_first = await anext(retry_chunks, b"")
+            if not retry_first:
+                await retry_resp.aclose()
+                return None
+            return retry_resp, retry_chunks, retry_first
+
         content_type = resp.headers.get("content-type", "").lower()
         if (resp.status_code not in (200, 206)
                 or any(x in content_type for x in ("text/", "json"))
                 or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
             # Reject servers ignoring identity: decoded bytes cannot use encoded
             # Content-Length/Range offsets, and must not enter the audio cache.
+            if on_death:
+                on_death()
             return None
         chunks = resp.aiter_bytes()
         first = await anext(chunks, b"")
         if not first:
+            if on_death:
+                on_death()
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
         # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
         if via_musicdl and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
             ext = "mp3"
-        result = (resp, owned, ext, info, chunks, first)
+        # 第 7 个元素必须是真正可 await 的 reconnect(offset)：此前误把
+        # reconnect_builder（只产 httpx.Request 的 lambda）传给了
+        # stream_tee_response，await 到 Request 必抛 TypeError，断流重连
+        # 从未生效——CDN 一断就跳歌。第 8 个元素 on_death 供断流时回收死链。
+        result = (resp, owned, ext, info, chunks, first, reconnect, on_death)
         resp = owned = None  # transfer ownership to response iterator
         return result
     finally:
         if resp:
             await resp.aclose()
+        # 提前判失败的路径（解析死链/首字节为空/上游拒收）同样要收掉新建的
+        # client，否则每次失败泄漏一个连接池，并发场景加剧 502。
+        if owned:
+            await owned.aclose()
         if owned:
             await owned.aclose()
 
@@ -3910,7 +5109,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3)
         if not opened:
             raise RuntimeError("open failed")
-        resp, owned, ext, info, chunks, first = opened
+        resp, owned, ext, info, chunks, first, _reconnect, _on_death = opened
         expected = None
         length = resp.headers.get("content-length", "")
         if length.isdigit():
@@ -4071,7 +5270,7 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
     opened = await _open_online_stream(fake_request, guid, f"bytes={written}-")
     if not opened:
         return False
-    resp, owned, stream_ext, info, chunks, first = opened
+    resp, owned, stream_ext, info, chunks, first, _reconnect, _on_death = opened
     try:
         if resp.status_code != 206:
             # 源忽略 Range 返回 200：无法续传
@@ -4630,30 +5829,250 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
             _register_background_fetch(request, guid, "fav_auto_bind")
 
 
+_STREAM_PREVIEW_TTL_S = 3.0
+_STREAM_PREVIEW_CACHE: dict[tuple[str, str, str], dict] = {}
+
+def _stream_preview_key(request: Request, guid: str, range_header: str | None) -> tuple[str, str, str]:
+    return (guid, range_header or "", _credential_scope(request))
+
+async def _close_stream_preview(preview: dict) -> None:
+    opened = preview.get("opened")
+    if not opened:
+        return
+    resp, owned, *_ = opened
+    try:
+        await resp.aclose()
+    except Exception:
+        pass
+    if owned:
+        try:
+            await owned.aclose()
+        except Exception:
+            pass
+
+def _schedule_stream_preview_expiry(key: tuple[str, str, str], preview: dict) -> None:
+    async def expire() -> None:
+        await asyncio.sleep(_STREAM_PREVIEW_TTL_S)
+        if _STREAM_PREVIEW_CACHE.get(key) is preview:
+            _STREAM_PREVIEW_CACHE.pop(key, None)
+            await _close_stream_preview(preview)
+    preview["cleanup_task"] = asyncio.create_task(expire())
+
+def _take_stream_preview(key: tuple[str, str, str]) -> tuple | None:
+    preview = _STREAM_PREVIEW_CACHE.pop(key, None)
+    if not preview:
+        return None
+    cleanup = preview.get("cleanup_task")
+    if cleanup and not cleanup.done():
+        cleanup.cancel()
+    if time.monotonic() >= preview["expires_at"]:
+        asyncio.create_task(_close_stream_preview(preview))
+        return None
+    return preview["opened"]
+
+
+# === 2.6.54 下一首预开流（preopen）===
+# 2.6.53 之后插件侧切歌已近零耗时，但外网手机点"下一首"时仍要自己连 CDN
+# （TLS 握手 + 首包 + 播放器缓冲，约 1~2s）。这里复刻安卓 ExoPlayer 的
+# "预备队列"思路：当前首播期间，后台把紧邻下一首的流真正打开（连上 CDN、
+# 取到首包），手机点下一首时直接从已开的流里出字节，首包等待降为一个网络
+# 往返。只预开 1 首；命中那次切歌走中转（手机↔NAS↔CDN，音乐码率低，NAS
+# 带宽开销可忽略）；TTL 内不切则自动关闭。预开只打 CDN、不消耗音源取链
+# 配额（URL 一律由 2.6.53 的预取解析好，预开只消费缓存里的链）；任何失败
+# 都静默回落现有路径（307 快路径/中转），成功率不受影响。
+_PREOPEN_TTL_S = float(os.environ.get("FNMUSIC_PREOPEN_TTL_S", "120"))
+_PREOPEN_MAX = int(os.environ.get("FNMUSIC_PREOPEN_MAX", "1"))
+_PREOPEN_STREAMS: dict[str, dict] = {}
+_PREOPEN_INFLIGHT: set[tuple[str, str]] = set()
+
+
+def _preopen_key(scope: str, guid: str) -> str:
+    return f"{scope}\x00{guid}"
+
+
+def _lx_url_cached_fresh(song_id: str) -> bool:
+    hit = _LX_URL_CACHE.get(song_id)
+    return bool(hit and time.time() - hit[1] < _LX_URL_CACHE_TTL_S)
+
+
+async def _preopen_wait_url(song_id: str, timeout_s: float) -> bool:
+    """等 2.6.53 预取把下一首的直链解析进缓存（预取与预开同批触发）。
+
+    预开绝不自行调音源取链：URL 已缓存 → 直接去连 CDN；预取还在跑 → 等它；
+    预取已放弃（冷却/无货）→ 本次不预开，播放请求走正常路径兜底。
+    """
+    if not song_id or _lx_url_cached_fresh(song_id):
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.15)
+        if _lx_url_cached_fresh(song_id):
+            return True
+        if song_id not in _LX_PREFETCH_RUNNING:
+            return False
+    return _lx_url_cached_fresh(song_id)
+
+
+async def _preopen_expiry(key: str, entry: dict) -> None:
+    await asyncio.sleep(_PREOPEN_TTL_S)
+    if _PREOPEN_STREAMS.get(key) is entry:
+        _PREOPEN_STREAMS.pop(key, None)
+        await _close_stream_preview(entry)
+
+
+def _take_preopen(guid: str, range_header: str | None, scope: str) -> "tuple | None":
+    """切歌时领取已预开的流。只有"从头取"（无 Range 或 bytes=0-）才匹配：
+    seek 请求的字节偏移和预开流对不上，丢弃预开流走正常路径（CDN 自会 Range）。"""
+    entry = _PREOPEN_STREAMS.pop(_preopen_key(scope, guid), None)
+    if not entry:
+        return None
+    cleanup = entry.get("cleanup_task")
+    if cleanup and not cleanup.done():
+        cleanup.cancel()
+    if time.monotonic() >= entry["expires_at"] or not should_cache(range_header):
+        asyncio.create_task(_close_stream_preview(entry))
+        return None
+    return entry["opened"]
+
+
+async def _preopen_next_track(request: Request, next_guid: str) -> None:
+    """后台预开页内紧邻下一首的流（fire-and-forget，失败静默）。"""
+    if not next_guid or not is_online_guid(next_guid):
+        return
+    if find_cache_file(next_guid):
+        return  # 本地文件 0ms 读，无需预开
+    if not _source_enabled(next_guid):
+        return
+    scope = _credential_scope(request)
+    key = _preopen_key(scope, next_guid)
+    if key in _PREOPEN_STREAMS or len(_PREOPEN_STREAMS) >= _PREOPEN_MAX:
+        return
+    inflight = (scope, next_guid)
+    if inflight in _PREOPEN_INFLIGHT:
+        return
+    _PREOPEN_INFLIGHT.add(inflight)
+    try:
+        song_id = song_id_from_online_guid(next_guid)
+        if not await _preopen_wait_url(song_id, 6.0):
+            return
+        opened = await asyncio.wait_for(
+            _open_online_stream(request, next_guid, "bytes=0-"), timeout=8.0)
+        if not opened:
+            return
+        if key in _PREOPEN_STREAMS or len(_PREOPEN_STREAMS) >= _PREOPEN_MAX:
+            await _close_stream_preview({"opened": opened})
+            return
+        entry = {"opened": opened, "expires_at": time.monotonic() + _PREOPEN_TTL_S}
+        _PREOPEN_STREAMS[key] = entry
+        entry["cleanup_task"] = asyncio.create_task(_preopen_expiry(key, entry))
+        logger.info("preopen ready for %s", next_guid)
+    except Exception:  # noqa: BLE001
+        logger.debug("preopen next track failed", exc_info=True)
+    finally:
+        _PREOPEN_INFLIGHT.discard(inflight)
+
+
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
-    """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
+    """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头。"""
     if cached:
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
         return Response(status_code=full.status_code, headers=dict(full.headers))
     opened = None
     try:
-        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
+        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=15.0)
     except Exception:
         opened = None
     if not opened:
         return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
-    resp, owned, _ext, _info, _chunks, _first = opened
+    resp, owned, _ext, _info, _chunks, _first, _reconnect, _on_death = opened
     headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
     for key in ("content-type", "content-length", "content-range"):
         val = resp.headers.get(key)
         if val:
             headers[key] = val
-    with anyio.CancelScope(shield=True):
-        await resp.aclose()
-        if owned:
-            await owned.aclose()
+    preview_key = _stream_preview_key(request, guid, range_header)
+    old = _STREAM_PREVIEW_CACHE.pop(preview_key, None)
+    if old:
+        asyncio.create_task(_close_stream_preview(old))
+    preview = {"opened": opened, "expires_at": time.monotonic() + _STREAM_PREVIEW_TTL_S}
+    _STREAM_PREVIEW_CACHE[preview_key] = preview
+    _schedule_stream_preview_expiry(preview_key, preview)
+    _preheat_track_assets(request, guid)
     return Response(status_code=206 if "content-range" in headers else 200, headers=headers)
+
+
+# === 2.6.36 首播预热：建流的同时后台静默取封面/歌词（fire-and-forget，
+# 绝不挡首包）。6h 冷却 + single-flight：同一首歌的重复 HEAD/GET 不反复触发。 ===
+_PREHEAT_INFLIGHT: set[str] = set()
+_PREHEAT_AT: dict[str, float] = {}
+_PREHEAT_COOLING_S = 6 * 3600.0
+# 2.6.37: 全局流控。NAS 现场实测：单 uvicorn 进程 + nginx 前置，并发 8 条流
+# 请求时 75% 失败（502/401），元凶是 2.6.36 后台管道无上限（每首播一首同时
+# 跑 5 平台封面搜索 + 20s 全模式歌词搜索 + 下一首预取），把主流请求拖死。
+# 桌面端同类回补只有并发 6 且建好缓存后不再搜索——这里更保守：预热全局
+# 最多 2 首并发、歌词回补 1 条、封面搜索 2 条在途，满则直接放弃本轮
+# （冷却/负缓存机制保证下轮还会试），主播放路径永远优先。
+_PREHEAT_JOB_MAX = 2
+_LYRIC_JOB_MAX = 1
+_COVER_SEARCH_MAX = 2
+_LYRIC_JOB_ACTIVE: "int" = 0
+_COVER_SEARCH_ACTIVE: "int" = 0
+_PREHEAT_STAGGER_S = 1.5
+_LYRIC_STAGGER_S = 4.0
+
+
+def _preheat_track_assets(request: Request, guid: str) -> None:
+    if not is_online_guid(guid):
+        return
+    if guid in _PREHEAT_INFLIGHT:
+        return
+    if len(_PREHEAT_INFLIGHT) >= _PREHEAT_JOB_MAX:
+        return
+    last = _PREHEAT_AT.get(guid)
+    if last is not None and time.monotonic() - last < _PREHEAT_COOLING_S:
+        return
+    _PREHEAT_AT[guid] = time.monotonic()
+    _PREHEAT_INFLIGHT.add(guid)
+
+    def _done(task: "asyncio.Task") -> None:
+        _PREHEAT_INFLIGHT.discard(guid)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except Exception:  # noqa: BLE001
+                pass
+
+    task = asyncio.create_task(_preheat_track_assets_task(request, guid))
+    task.add_done_callback(_done)
+
+
+async def _preheat_track_assets_task(request: Request, guid: str) -> None:
+    await asyncio.sleep(_PREHEAT_STAGGER_S)  # 让主流/客户端先走完首包
+    try:
+        data = await _online_info(request, guid, include_lyric=False)
+    except Exception as e:
+        logger.debug("preheat info failed for %s: %s", guid, e)
+        return
+    if not data:
+        return
+    try:
+        if not _read_cover_cache(guid):
+            tail = await _cover_fallback_tail(request, guid, data)
+            if isinstance(tail, RedirectResponse):
+                # 直构/补全命中的是 302：把目标图下载落盘，客户端后续请求直接走缓存
+                target = str(tail.headers.get("location") or "")
+                if target:
+                    got = await asyncio.to_thread(download_cover_bytes, target)
+                    if got:
+                        _write_cover_cache(guid, got[0], got[1])
+    except Exception as e:
+        logger.debug("preheat cover failed for %s: %s", guid, e)
+    try:
+        if not read_lyric_cache(guid):
+            _ensure_lyric_backfill(request, guid, data)
+    except Exception as e:
+        logger.debug("preheat lyric failed for %s: %s", guid, e)
 
 
 def _candidate_kbps(item: dict) -> float:
@@ -4693,6 +6112,149 @@ def ordered_stream_alternatives(item: dict) -> list[dict]:
     return sorted(alts, key=lambda x: rank.get(round(_candidate_kbps(x), 1), len(order)))
 
 
+# ============================================================================
+# 方案B：外网直连 CDN（2.6.26）
+#
+# 在线歌播放时先解析出 CDN 直链，再做一次“裸请求”探测（模拟手机、
+# 不带 Referer/UA）：CDN 真的接受直连才 307 把客户端重定向到 CDN 取流
+# （绕过 NAS 中转，接近洛雪客户端直连体验、更接近官方速度）。任一步失败
+# 都自动回落下面的现有中转路径，起播率不劣于旧路径。
+#
+# 支持源：lx（洛雪用户源）、netease（网易盒子）；其他源（酷我/咪咕等）
+# 无独立可直连地址，继续走中转。音质按插件设置：解析阶段与现有路径完全
+# 一致（同档序/同替代曲逻辑），只有交付路径不同。
+# 开关：FNMUSIC_WAN_DIRECT（默认 true）；管理页「播放与推荐」可关，.env
+# 热重载立即生效；关闭即完全恢复旧行为。
+# ============================================================================
+_WAN_DIRECT_PROBE_TIMEOUT_S = 3.0
+_WAN_DIRECT_RESOLVE_TIMEOUT_S = 12.0
+
+
+_PROBE_CLIENT: "httpx.AsyncClient | None" = None
+
+
+def _probe_client() -> httpx.AsyncClient:
+    """共享 CDN 探测客户端：复用连接（同 CDN 反复探测不重建 TCP/TLS 会话）。"""
+    global _PROBE_CLIENT
+    if _PROBE_CLIENT is None or _PROBE_CLIENT.is_closed:
+        _PROBE_CLIENT = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=_WAN_DIRECT_PROBE_TIMEOUT_S,
+            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=30.0),
+        )
+    return _PROBE_CLIENT
+
+
+def reset_probe_client() -> None:
+    """测试入口：丢弃旧客户端，防止 mock transport 跨用例泄漏。"""
+    global _PROBE_CLIENT
+    client, _PROBE_CLIENT = _PROBE_CLIENT, None
+    if client is not None and not client.is_closed:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _wan_direct_probe(url: str, range_header: str | None,
+                            headers: "dict | None" = None) -> "tuple[bool, str]":
+    """“裸请求”（无 Referer/UA，模拟手机）验证 CDN 直链可播。
+
+    传入源专属 headers 时按带请求头口径复验（用于区分防盗链与死链）。
+    CDN 若要求源专属请求头（防盗链），裸请求会 403/回文本，手机直连必然不稳，
+    此时中转路径（能带正确请求头）比重定向更可靠，由调用方回落。
+    """
+    req_headers = {"Accept-Encoding": "identity"}
+    if range_header:
+        req_headers["Range"] = range_header
+    if headers:
+        for key, value in headers.items():
+            if value:
+                req_headers[str(key)] = str(value)
+    client = _probe_client()
+    try:
+        resp = await client.send(client.build_request("GET", url, headers=req_headers), stream=True)
+    except Exception as exc:
+        return False, f"probe {type(exc).__name__}"
+    status = resp.status_code
+    ctype = resp.headers.get("content-type", "").lower()
+    ce = resp.headers.get("content-encoding", "identity").strip().lower()
+    first = b""
+    try:
+        first = await anext(resp.aiter_bytes(), b"")
+    except Exception:
+        first = b""
+    try:
+        await resp.aclose()
+    except Exception:
+        pass
+    ok = (
+        status in (200, 206)
+        and not any(x in ctype for x in ("text/", "json", "html"))
+        and ce in ("", "identity")
+        and bool(first)
+    )
+    return ok, f"status={status} ctype={ctype or 'n/a'}"
+
+# TOP[top.wan.direct] 外网直连：探测通过后 302 到音源 CDN（端侧直拉，NAS 只解地址）
+async def _wan_direct_redirect(request: Request, guid: str, range_header: str | None):
+    """方案B：直链验证通过返回 307 重定向响应；不可用时返回 None（调用方继续现有路径）。"""
+    if not CONF.get("wan_direct_enabled"):
+        return None
+    source = source_from_online_guid(guid)
+    if source not in ("lx", "netease"):
+        return None
+    if not CONF.get({"lx": "lx_enabled", "netease": "netease_enabled"}.get(source, "")):
+        return None
+    url = None
+    try:
+        if source == "lx":
+            resolved = await asyncio.wait_for(
+                resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid)),
+                timeout=_WAN_DIRECT_RESOLVE_TIMEOUT_S,
+            )
+            if resolved:
+                url = str(resolved.get("url") or "")
+        else:
+            url = await asyncio.wait_for(
+                resolve_netease_url(
+                    get_musicbox_client(request.app),
+                    song_id_from_online_guid(guid).split(":")[-1],
+                ),
+                timeout=_WAN_DIRECT_RESOLVE_TIMEOUT_S,
+            )
+    except Exception as exc:
+        logger.info("[wan-direct] resolve failed for %s: %s", guid, type(exc).__name__)
+        return None
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    if not _lx_url_probe_ok(song_id_from_online_guid(guid), url):
+        ok, detail = await _wan_direct_probe(url, range_header)
+        if not ok:
+            logger.info("[wan-direct] probe rejected for %s (%s): %s", guid, source, detail)
+            return None
+    else:
+        # 2.6.53：预取已按手机口径验证过这条链（新鲜窗口内）→ 跳过 inline 探测
+        logger.info("[wan-direct] prefetch-verified, skip inline probe for %s", guid)
+    logger.warning("[wan-direct] direct %s (%s) -> %s", guid, source, url[:100])
+    return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store"})
+
+@app.exception_handler(Exception)
+async def _stream_unhandled_to_404(request: Request, exc: Exception) -> Response:
+    """2.6.37: 流媒体路径上的未捕获异常一律回 404 干净跳过。
+
+    NAS 现场实测：后台负载把单进程事件循环打满时，流请求会以 500/连接重置
+    形式炸出（客户端表现同样是跳歌）。流路径降级成 404（客户端标准跳歌），
+    其他路径保留原语义（500 JSON）。
+    """
+    if str(request.url.path).startswith("/music/api/v1/track/stream"):
+        logger.exception("stream request unhandled for %s: %s", request.url.path, exc)
+        return JSONResponse(content={"code": 404, "msg": "online source unavailable",
+                                     "data": None}, status_code=404)
+    return JSONResponse(content={"code": 500, "msg": str(exc)[:200], "data": None},
+                        status_code=500)
+
+
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
@@ -4701,10 +6263,61 @@ async def stream_track(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
+    # ---- 2.6.54 预开命中：当前首播期间后台已把下一首的流打开（CDN 已连上+首包在手）----
+    # 必须先于方案B 307 检查：预开流首包在手，比再解析+再探测更快。只针对
+    # "GET 从头播"；seek（Range 偏移）不匹配预开，_take_preopen 自动丢弃并
+    # 落到方案B/中转；_ext_rendition=1（客户端已持有中转地址）不得中途换流。
+    if (not cached and request.method == "GET"
+            and request.query_params.get("_ext_rendition") != "1"):
+        pre_opened = _take_preopen(guid, range_header, _credential_scope(request))
+        if pre_opened:
+            resp, owned, ext, info, chunks, first, reconnect_fn, on_death = pre_opened
+            _schedule_next_track_prefetch(guid, request)
+            _preheat_track_assets(request, guid)
+            return stream_tee_response(resp, guid, range_header,
+                coro_factory=lambda: _online_info(request, guid, include_lyric=bool(CONF.get("lyric_auto_dl"))),
+                client_to_close=owned, resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
+                scan_headers_factory=lambda: copy_incoming_headers(request),
+                post_finalize=lambda meta: _auto_lyric_after_finalize(request, guid, meta),
+                reconnect=reconnect_fn, on_death=on_death)
+    # ---- 方案B：外网直连CDN（2.6.26，FNMUSIC_WAN_DIRECT）----
+    # 仅在“无本地缓存 + GET 取音频 + 非锁定 rendition 重请求”时介入：本地磁盘永远
+    # 快于 CDN；HEAD 保留现有预热路径（顺带把直链解析进 30 分钟缓存，随后 GET
+    # 的解析与探测近乎零成本）；_ext_rendition=1 表示客户端已持有中转地址
+    # （字节偏移必须一致），不得中途切到 CDN。任何一步失败都自动回落到
+    # 下面的现有中转路径，不影响现有行为。
+    if (
+        not cached
+        and request.method == "GET"
+        and request.query_params.get("_ext_rendition") != "1"
+    ):
+        direct = await _wan_direct_redirect(request, guid, range_header)
+        if direct is not None:
+            # 外网直连路径也要喂“下一首预取”：否则 307 场景下预取永不触发，
+            # 每次切歌都要现解析 + 现探测（2.6.53 补漏）。
+            _schedule_next_track_prefetch(guid, request)
+            _preheat_track_assets(request, guid)
+            return direct
+    preview_key = _stream_preview_key(request, guid, range_header)
+    preview_opened = _take_stream_preview(preview_key)
+    if preview_opened:
+        resp, owned, ext, info, chunks, first, reconnect_fn, on_death = preview_opened
+        if not should_cache(range_header):
+            _register_full_fetch(request, guid)
+        _schedule_next_track_prefetch(guid, request)
+        _preheat_track_assets(request, guid)
+        return stream_tee_response(resp, guid, range_header,
+            coro_factory=lambda: _online_info(request, guid, include_lyric=bool(CONF.get("lyric_auto_dl"))),
+            client_to_close=owned, resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
+            scan_headers_factory=lambda: copy_incoming_headers(request),
+            post_finalize=lambda meta: _auto_lyric_after_finalize(request, guid, meta),
+            reconnect=reconnect_fn, on_death=on_death)
     log_stream_probe(request.method, guid, range_header, bool(cached))
     if request.method == "HEAD":
+        _schedule_next_track_prefetch(guid, request)
         return await _stream_head_response(request, guid, cached, range_header)
     if cached:
+        _schedule_next_track_prefetch(guid, request)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
     item, entry = _retained_track(request, guid)
@@ -4712,8 +6325,10 @@ async def stream_track(request: Request, subpath: str = ""):
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
-    deadline = asyncio.get_running_loop().time() + 12.0
-    for candidate in list(dict.fromkeys(candidates))[:3]:
+    # 总预算覆盖“多音质递降 + 多源回退 + CDN 建连 + 首包”。飞牛客户端收到
+    # 404 就会立刻跳歌，所以宁可在这里多等几秒，也别把还能播的歌判死。
+    deadline = asyncio.get_running_loop().time() + float(CONF.get("stream_startup_budget_s", 32.0))
+    for candidate in list(dict.fromkeys(candidates))[:4]:
         if not _source_enabled(candidate):
             continue
         for attempt in range(2):
@@ -4722,12 +6337,12 @@ async def stream_track(request: Request, subpath: str = ""):
                 break
             try:
                 # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(32.0, remaining))
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
             if opened:
-                resp, owned, ext, info, chunks, first = opened
+                resp, owned, ext, info, chunks, first, reconnect_fn, on_death = opened
                 if candidate != guid:
                     # Publish the selected source identity before any audio.
                     # The client owns B's URL for later Range requests even if
@@ -4749,14 +6364,26 @@ async def stream_track(request: Request, subpath: str = ""):
                 if not should_cache(range_header):
                     # 定长窗口客户端：本响应过不了 tee 写盘门，注册后台整轨下载兜底
                     _register_full_fetch(request, candidate)
+                # 当前首已经取到流：顺手预热页内下一首，给切歌留出准备时间。
+                _schedule_next_track_prefetch(guid, request)
+                _preheat_track_assets(request, guid)
                 return stream_tee_response(resp, candidate, range_header,
                     coro_factory=lambda: _online_info(request, candidate, include_lyric=bool(CONF.get("lyric_auto_dl"))),
                     client_to_close=owned,
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
                     scan_headers_factory=lambda: copy_incoming_headers(request),
-                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
-            if attempt or deadline - asyncio.get_running_loop().time() <= 3:
+                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta),
+                    reconnect=reconnect_fn, on_death=on_death)
+            if deadline - asyncio.get_running_loop().time() <= 3:
                 break
+            if attempt == 0:
+                # 实测：104 首高风险曲目里有 6 首首次 404，清掉单曲负缓存后
+                # 立刻重试即 206。飞牛客户端收到 404 就直接跳歌，不会自己再试，
+                # 所以这一枪必须由 proxy 自己补上（原逻辑被 _recover_source
+                # 挡在门外，第二次 attempt 实际上从未真正重新解析）。
+                _LX_FAIL_COOLDOWN.pop(song_id_from_online_guid(candidate), None)
+                await asyncio.sleep(0.25)
+                continue
             if not await _recover_source(request, candidate, entry):
                 break
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
@@ -4778,6 +6405,14 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
         if source == "lx":
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
             if not resolved or not resolved.get("url"):
+                # 此前静默返回：调用方发“假列表”被 App 拒收 → 跳歌，
+                # 日志里却什么都看不到。至少把真实原因喊出来。
+                logger.warning(
+                    "transcode source unavailable (lx): %s fail_cd=%s platform_cooled=%s",
+                    song_id_from_online_guid(guid),
+                    time.time() < _LX_FAIL_COOLDOWN.get(song_id_from_online_guid(guid), 0.0),
+                    _lx_platform_cooled(song_id_from_online_guid(guid)),
+                )
                 return None, None
             headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
                        if k.lower() in ("referer", "user-agent")}
@@ -4820,6 +6455,9 @@ def _transcode_live(guid: str) -> "tc.Session | None":
 
 def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
     """无 ffmpeg / 源不可用时的兜底：单分片=原始文件（历史行为）。"""
+    # App 实测不认这种假列表（收到后 1 秒内 quit 跳下一首），
+    # 必须留下日志才能统计它出现的频率和对应的歌。
+    logger.warning("hls STUB served (no transcode session/source): %s", guid)
     try:
         duration_s = int(float((info or {}).get("duration_s") or 0))
     except (TypeError, ValueError):
@@ -4840,6 +6478,64 @@ def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
     return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
 
 
+def _hls_playlist_base(request: Request) -> str:
+    """HLS 分片地址前缀：外网绝对地址 + 主机强制小写。
+
+    反代（Lucky）按 Host 做大小写敏感的域名匹配，而系统播放器不会像 App 的
+    网络库那样把域名小写化，导致分片请求在反代层 404、根本到不了这里。
+    统一下发小写主机的绝对地址后，无论 App 里填的是大写还是小写都能播。
+
+    地址取反代回传的真实入口：x-forwarded-host 保留原始端口，
+    x-real-proto 记录客户端到反代那一跳的协议（x-forwarded-proto 是
+    反代到本插件这一跳，通常是 http，不能直接用）。
+    """
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or ""
+    ).split(",")[0].strip().lower()
+    if not host:
+        return ""
+    bare = host.split(":")[0]
+    if "." not in bare and not host.startswith("["):
+        # localhost / unix-socket 网关场景保持相对地址，避免写出不可达主机
+        return ""
+    # 只在确认「客户端到反代那一跳是 https」时才下发绝对地址；
+    # 其余情况（局域网直连、走 http 入口等）保持相对地址，避免把
+    # 分片指到错误协议/端口上反而播不了。
+    real_proto = (request.headers.get("x-real-proto") or "").split(",")[0].strip().lower()
+    if real_proto != "https":
+        return ""
+    base_dir = request.url.path.rsplit("/", 1)[0] + "/"
+    return f"https://{host}{base_dir}"
+
+
+_HLS_DEBUG_PATH = os.path.join(CONF.get("cache_dir") or _HOME, "hls_debug.log")
+
+
+def _hls_debug_note(request: Request, note: str) -> None:
+    """把 HLS 播放列表请求的真实转发头写到独立文件（takeover 日志白名单会丢 info 行）。"""
+    try:
+        path = _HLS_DEBUG_PATH
+        if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+            os.replace(path, path + ".1")
+        rec = {
+            "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "path": request.url.path,
+            "host": request.headers.get("host", ""),
+            "xfh": request.headers.get("x-forwarded-host", ""),
+            "xrp": request.headers.get("x-real-proto", ""),
+            "xfp": request.headers.get("x-forwarded-proto", ""),
+            "xfport": request.headers.get("x-forwarded-port", ""),
+            "ua": (request.headers.get("user-agent") or "")[:70],
+            "note": note,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 @app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/hls/{guid}/{filename}", methods=["GET", "HEAD"])
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
@@ -4855,13 +6551,23 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
         # App 有时不先 POST /track/transcode 直接拉 playlist（实测），此处惰性补启
         sess = await _start_transcode_session(request, guid)
 
+    logger.info("hls request: %s %s", guid, filename)
     if sess is not None:
         if filename == "preset.m3u8":
+            # 原版行为：会话一启动就立即返回列表（App 只拉一次，必须一次给全），
+            # 分片未就绪由下面的 wait_file 按需等待。
+            # init.mp4 必须有实际内容再发列表：远程源 ffmpeg 要先下载才能写 init，
+            # 不等就发列表 → App 立刻取 init → 0 字节 → 解码失败 → 跳歌。
+            await tc.wait_file(os.path.join(sess.directory, tc.INIT_NAME), sess, timeout=25.0)
+            _hls_debug_note(request, "relative")
             return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl")
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
+            # 原版行为：init 用 audio/mp4，分片用 video/iso.segment，
+            # 支持 Range（App 实测就是这么请求的）。
             media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"
             return serve_file_with_range(path, request.headers.get("range"), media)
+        logger.warning("hls segment unavailable: %s %s", guid, filename)
         return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
 
     if filename != "preset.m3u8":
@@ -5126,20 +6832,62 @@ async def dl_transcode_delete(request: Request):
 
 
 async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
+    override = _CERU_SOURCE_OVERRIDES.get(guid)
+    if override and override != guid:
+        data = await _online_info(request, override, include_lyric=include_lyric)
+        if data:
+            return {**data, "id": guid, "source": source_from_online_guid(guid) or data.get("source")}
     retained, entry = _retained_track(request, guid)
     if not _source_enabled(guid):
         return retained
     try:
         data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=4.0)
         if data:
-            return data
+            return _merge_lx_alt_info(guid, _ceru_enrich_info(guid, data))
         if await _recover_source(request, guid, entry):
             data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=3.0)
             if data:
-                return data
+                return _merge_lx_alt_info(guid, _ceru_enrich_info(guid, data))
     except Exception:
         pass
-    return retained
+    merged_retained = _merge_lx_alt_info(guid, retained or {})
+    return merged_retained or retained
+
+
+def _merge_lx_alt_info(guid: str, data: dict) -> dict:
+    """换源只允许补文本元数据，绝不允许用替代源的封面覆盖原歌曲封面。"""
+    alt = _lx_alt_meta_for(guid)
+    if not alt:
+        return data
+    merged = dict(data or {})
+    for key in ("title", "artist", "album", "duration_s", "ext"):
+        if not merged.get(key) and alt.get(key):
+            merged[key] = alt[key]
+    return merged
+
+
+def _ceru_enrich_info(guid: str, data: dict) -> dict:
+    """Ceru 直连歌曲缺字段时，用原歌曲登记表补齐标题/歌手/封面等。"""
+    if not isinstance(data, dict):
+        return data
+    ceru_song = ceru.song_for_guid(guid)
+    if not ceru_song:
+        return data
+    enriched = dict(data)
+    if not str(enriched.get("title") or "").strip():
+        enriched["title"] = ceru.song_title(ceru_song)
+    if not str(enriched.get("artist") or "").strip():
+        enriched["artist"] = ceru.song_artist(ceru_song)
+    if not str(enriched.get("album") or "").strip():
+        enriched["album"] = ceru.song_album(ceru_song)
+    if not enriched.get("duration_s"):
+        enriched["duration_s"] = ceru.song_duration_s(ceru_song)
+    # 封面与播放源解耦：只要 Ceru 侧有原封面，就始终以它为准，
+    # 不允许当前解析平台自带的封面覆盖（否则换源后封面会跟着变）。
+    artwork = ceru.song_artwork(ceru_song)
+    if artwork:
+        enriched["cover_url"] = artwork
+    return enriched
 
 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
@@ -5220,7 +6968,16 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         if not lyric_text and include_lyric:
                             try:
                                 lr = await lx_client.get(
-                                    "/api/v1/track/lyric", params={"id": song_id}, timeout=10.0
+                                    "/api/v1/track/lyric",
+                                    params={
+                                        "id": song_id,
+                                        # 2.6.36: 同步路径只做播放平台直连解析（亚秒级）；
+                                        # 拿不到词由 _ensure_lyric_backfill 后台全模式回补。
+                                        "fast": "1",
+                                        "title": str(inner.get("title") or ""),
+                                        "artist": str(inner.get("artist") or ""),
+                                    },
+                                    timeout=10.0,
                                 )
                                 if lr.status_code == 200:
                                     l_res = lr.json()
@@ -5304,8 +7061,16 @@ async def track_metadata(request: Request, subpath: str = ""):
             title=str(data.get("title") or ""),
             artist=str(data.get("artist") or ""),
         )
+    if not str(data.get("lyric") or "").strip():
+        # fast=1 拿不到词：后台全模式回补（播放页元数据轮询是自然触发点）
+        _ensure_lyric_backfill(request, guid, data)
     payload = build_metadata_payload(guid, data)
-    if guid in await _online_favorite_set(request):
+    # Ceru 曲：播放页元数据对齐列表行契约（同 coverId/原封面/标星口径），
+    # 否则播放页用新值覆盖列表已渲染状态，星与封面都会「闪现后消失」。
+    ceru_song = ceru.song_for_guid(guid) if _ceru_on() else None
+    if ceru_song is not None:
+        _apply_ceru_metadata_fields(guid, ceru_song, payload)
+    if await _track_is_favorite(request, guid, data):
         if isinstance(payload.get("data"), dict):
             payload["data"]["isFavorite"] = True
             if isinstance(payload["data"].get("track"), dict):
@@ -5313,12 +7078,43 @@ async def track_metadata(request: Request, subpath: str = ""):
     return JSONResponse(content=disguise_client_json(payload))
 
 
-# === 封面兜底链：cover_url 302 → 源 CDN 直构（kw rid / qq albummid）→
-# 网易 cloudsearch 补全 → 本地缓存文件内嵌图 → 本地占位图池。
+# === 封面兜底链（2.6.36 统一 tail）：cover_url 302 → 源 CDN 直构（kw rid / qq albummid）→
+# 跨源搜索补齐（/api/v1/cover/search，落 cover_cache）→ 网易 cloudsearch 补全（仅启用时）→
+# 本地缓存文件内嵌图 → 本地占位图池。
 # 在线曲目封面永不 404（空封面是客户端裂图的主要来源）。 ===
 _COVER_CDN_CACHE: dict[str, tuple[str, float]] = {}
 _COVER_CDN_TTL_S = 7 * 86400.0
 _KW_TEXT_COVER_HOST = dailyrec.KW_TEXT_COVER_HOST
+
+
+def _cover_url_unusable(url: str) -> bool:
+    """客户端无法直接取到的封面地址：为空、酷我文本封面、内网地址。
+
+    内网地址典型来源：其他设备把本机 fnMusic 的封面端点 URL（如
+    http://192.168.x.x:5666/music/api/v1/static/cover?coverId=...）作为 artwork 写进
+    同步服务器——无会话访问 401、外网完全不可达。这类地址若 302 给客户端，
+    会反复裂图/闪占位图；必须走兜底链（源封面/本地缓存/占位图池）。
+    """
+    if not url:
+        return True
+    if _KW_TEXT_COVER_HOST in url:
+        return True
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return True
+    if not host:
+        return True
+    if host == "localhost" or host.endswith((".local", ".home.arpa")):
+        return True
+    parts = host.split(".")
+    if parts[0].isdigit():
+        first = int(parts[0])
+        if first in (10, 127, 192, 169):
+            return True
+        if first == 172 and len(parts) > 1 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
+            return True
+    return False
 _PLACEHOLDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "covers")
 _PLACEHOLDER_COUNT = 6
 _PLACEHOLDER_CACHE: dict[str, bytes] = {}
@@ -5344,6 +7140,72 @@ def _cover_cache_put(key: str, url: str) -> None:
     _COVER_CDN_CACHE[key] = (url, time.time())
 
 
+_COVER_CACHE_DIR = (
+    os.environ.get("FNMUSIC_COVER_CACHE_DIR") or os.path.join(_HOME, "cover_cache")
+)
+# 2.6.36: 封面缓存永久保留、不随时间过期——同一首歌补到的图就一直用。
+# 清理只走歌曲删除流程：favorite-track/delete 末尾 _purge_cover_cache(guid)。
+
+
+def _cover_cache_path(guid: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(guid or ""))
+    return os.path.join(_COVER_CACHE_DIR, f"{safe}.img")
+
+
+def _read_cover_cache(guid: str) -> "tuple[bytes, str] | None":
+    path = _cover_cache_path(guid)
+    try:
+        if not os.path.exists(path):
+            return None
+        data = open(path, "rb").read()
+        mime = _sniff_image_mime(data)
+        if data and mime:
+            return data, mime
+    except OSError:
+        pass
+    return None
+
+
+def _write_cover_cache(guid: str, data: bytes, mime: str) -> None:
+    if not data or not mime:
+        return
+    path = _cover_cache_path(guid)
+    part = f"{path}.{uuid4().hex[:8]}.part"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(part, "wb") as f:
+            f.write(data)
+        os.replace(part, path)
+    except OSError as e:
+        logger.debug("cover cache write failed for %s: %s", guid, e)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+
+
+def _purge_cover_cache(guid: str) -> None:
+    try:
+        os.remove(_cover_cache_path(guid))
+    except OSError:
+        pass
+
+
+async def _cached_cover_response(guid: str, url: str) -> Response:
+    cached = _read_cover_cache(guid)
+    if cached:
+        data, mime = cached
+        return Response(content=data, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+    try:
+        data, mime = await asyncio.to_thread(download_cover_bytes, url)
+    except Exception:
+        data, mime = None, ""
+    if data and mime:
+        _write_cover_cache(guid, data, mime)
+        return Response(content=data, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+    return RedirectResponse(url, status_code=302)
+
+
 def _kw_rid_from_guid(guid: str) -> str:
     """酷我 rid：lx 平台 online:lx:kw:<rid>；musicdl online:kuwo:<rid>。"""
     parts = (guid or "").split(":")
@@ -5365,14 +7227,50 @@ def _cover_cdn_client() -> httpx.AsyncClient:
 _COVER_CDN_TRANSPORT: "httpx.AsyncBaseTransport | None" = None
 
 
-async def _kw_cover_by_rid(rid: str) -> str:
-    """酷我 artistpicserver 按 rid 取真图（接口返回文本，需解析出图片地址）。"""
-    rid = str(rid or "").strip()
-    if not rid.isdigit():
+_KW_BYID_NEGATIVE: dict[str, float] = {}
+_KW_BYID_NEGATIVE_TTL_S = 6 * 3600.0
+_KW_BYID_DAILY_BUDGET = int(os.environ.get("FNMUSIC_KW_BYID_DAILY_BUDGET", "500"))
+_KW_BYID_CALLS: dict[str, Any] = {"date": "", "count": 0}
+
+
+def _kw_byid_charge() -> bool:
+    """酷我按 ID 取图每日额度（官方接口有访问限制，超限当天不再打）。"""
+    today = time.strftime("%Y-%m-%d")
+    if _KW_BYID_CALLS["date"] != today:
+        _KW_BYID_CALLS["date"] = today
+        _KW_BYID_CALLS["count"] = 0
+    if _KW_BYID_CALLS["count"] >= _KW_BYID_DAILY_BUDGET:
+        return False
+    _KW_BYID_CALLS["count"] += 1
+    return True
+
+
+async def _kw_cover_by_songinfo(rid: str) -> str:
+    """酷我按 ID 取图（与手机端同思路：知道 ID 就按 ID 查，不做关键词搜索）。
+
+    问 lxmusic-service 要而不是自己打酷我：那条 songinfoandlrc 一次调用同时给
+    封面与歌词，服务侧带 7 天缓存与合流，补封面顺带把歌词也补好，官方接口
+    每首歌只打一次（此前两边各打一次，白烧一倍额度）。
+    """
+    try:
+        async with _cover_cdn_client() as client:
+            r = await client.get(
+                f"{CONF['lx_url'].rstrip('/')}/api/v1/track/songinfo",
+                params={"id": f"lx:kw:{rid}"},
+                timeout=12.0,
+            )
+        if r.status_code != 200:
+            return ""
+        data = (r.json() or {}).get("data") or {}
+        pic = str(data.get("pic") or "").strip()
+        return pic if pic.startswith("http") else ""
+    except Exception as e:  # noqa: BLE001
+        logger.debug("kw songinfo cover resolve failed for rid=%s: %s", rid, e)
         return ""
-    cached = _cover_cache_get(f"kw:{rid}")
-    if cached:
-        return cached
+
+
+async def _kw_cover_by_artistpic(rid: str) -> str:
+    """酷我 artistpicserver 按 rid 取图（接口返回文本，需解析出图片地址）。"""
     url = (
         "https://artistpicserver.kuwo.cn/pic?corp=kuwo&type=rid_pic"
         f"&pictype=500&size=500&rid={rid}"
@@ -5388,12 +7286,33 @@ async def _kw_cover_by_rid(rid: str) -> str:
         m = re.search(r"https?://[^\s'\"<>]+?\.(?:jpg|jpeg|png|webp)", r.text, re.IGNORECASE)
         if not m:
             return ""
-        real = m.group(0)
+        return m.group(0)
     except Exception as e:
         logger.debug("kw artistpic resolve failed for rid=%s: %s", rid, e)
         return ""
-    _cover_cache_put(f"kw:{rid}", real)
-    return real
+
+
+async def _kw_cover_by_rid(rid: str) -> str:
+    """酷我按 ID 取封面：先 songinfoandlrc（按 ID 查，1 次轻量请求），
+    再 artistpicserver 兜底。未命中记 6h 负缓存 + 每日额度限制。"""
+    rid = str(rid or "").strip()
+    if not rid.isdigit():
+        return ""
+    cached = _cover_cache_get(f"kw:{rid}")
+    if cached:
+        return cached
+    if _KW_BYID_NEGATIVE.get(rid, 0.0) > time.monotonic():
+        return ""
+    if not _kw_byid_charge():
+        return ""
+    real = await _kw_cover_by_songinfo(rid)
+    if not real:
+        real = await _kw_cover_by_artistpic(rid)
+    if real:
+        _cover_cache_put(f"kw:{rid}", real)
+        return real
+    _KW_BYID_NEGATIVE[rid] = time.monotonic() + _KW_BYID_NEGATIVE_TTL_S
+    return ""
 
 
 def _qq_cover_by_albummid(albummid: "str | None") -> str:
@@ -5492,8 +7411,143 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
     return None
 
 
+# === 2.6.36 跨源封面补齐：播放源给不出封面时，用服务端 /api/v1/cover/search
+# 并行搜 5 平台（与桌面端 coverResolver 同款匹配/打分算法），命中即下载落
+# cover_cache。未命中记 6h 负缓存，避免同一首歌反复打搜索端点。 ===
+_COVER_SEARCH_NEGATIVE: dict[str, float] = {}
+_COVER_SEARCH_NEGATIVE_TTL_S = 6 * 3600.0
+
+
+def _cover_search_meta(guid: str, data: "dict | None") -> "dict | None":
+    d = data if isinstance(data, dict) else {}
+    title = str(d.get("title") or "").strip()
+    artist = str(d.get("artist") or "").strip()
+    album = str(d.get("album") or "").strip()
+    try:
+        duration_s = float(d.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        duration_s = 0.0
+    if not (title or artist):
+        song = ceru.song_for_guid(guid)
+        if song:
+            title = title or ceru.song_title(song)
+            artist = artist or ceru.song_artist(song)
+            album = album or ceru.song_album(song)
+            if not duration_s:
+                duration_s = ceru.song_duration_s(song)
+    if not title:
+        return None
+    source = str(d.get("lx_source") or "").strip().lower()
+    src_id = ""
+    if not source:
+        parts = str(guid or "").split(":")
+        if len(parts) >= 4 and parts[1] == "lx":
+            source = parts[2]
+            src_id = parts[3]
+    if not src_id:
+        raw_id = str(d.get("id") or "")
+        if raw_id.startswith("lx:") and raw_id.split(":")[1] == source:
+            src_id = raw_id.split(":")[2]
+    return {
+        "title": title, "artist": artist, "album": album,
+        "duration_s": duration_s, "source": source, "src_id": src_id,
+    }
+
+
+async def _cross_source_cover_response(request: Request, guid: str, data: "dict | None") -> "Response | None":
+    """跨源封面搜索命中 → 下载落 cover_cache 直接 200；任何失败一律 None（fail-soft）。"""
+    cached = _read_cover_cache(guid)
+    if cached:
+        content, mime = cached
+        return Response(content=content, media_type=mime,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    meta = _cover_search_meta(guid, data)
+    if not meta:
+        return None
+    now = time.monotonic()
+    last_fail = _COVER_SEARCH_NEGATIVE.get(guid)
+    if last_fail is not None and now - last_fail < _COVER_SEARCH_NEGATIVE_TTL_S:
+        return None
+    global _COVER_SEARCH_ACTIVE
+    if _COVER_SEARCH_ACTIVE >= _COVER_SEARCH_MAX:
+        return None  # 在途上限：本轮放弃（不记负缓存，下个请求/页还会试）
+    _COVER_SEARCH_ACTIVE += 1
+    try:
+        lx_client = get_lx_client(request.app)
+        try:
+            r = await lx_client.get(
+                "/api/v1/cover/search",
+                params={
+                    "title": meta["title"],
+                    "artist": meta["artist"],
+                    "album": meta["album"],
+                    "duration": f"{meta['duration_s']:.1f}",
+                    "source": meta.get("source") or "",
+                },
+                timeout=13.0,
+            )
+            payload = r.json() if r.status_code == 200 else {}
+        except Exception as e:
+            logger.debug("cross-source cover search failed for %s: %s", guid, e)
+            _COVER_SEARCH_NEGATIVE[guid] = now
+            return None
+        best: "dict | None" = None
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            best = payload["data"]
+        cover = str((best or {}).get("cover_url") or "").strip()
+        if not cover or _cover_url_unusable(cover):
+            _COVER_SEARCH_NEGATIVE[guid] = now
+            return None
+        try:
+            got = await asyncio.to_thread(download_cover_bytes, cover)
+        except Exception as e:
+            logger.debug("cross-source cover download failed for %s: %s", guid, e)
+            got = None
+        if not got:
+            _COVER_SEARCH_NEGATIVE[guid] = now
+            return None
+        content, mime = got
+        _write_cover_cache(guid, content, mime)
+        logger.info("cross-source cover fill ok for %s (via %s)", guid, (best or {}).get("lx_source") or "")
+        return Response(content=content, media_type=mime,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    finally:
+        _COVER_SEARCH_ACTIVE -= 1
+
+
+async def _cover_fallback_tail(request: Request, guid: str, data: "dict | None") -> "Response | None":
+    """封面兜底链统一 tail：源 CDN 直构 → 跨源搜索补齐 → 网易补全（仅启用时）→ 内嵌图。
+    全未命中返回 None，由调用方回落占位图（保持原行为）。"""
+    direct = ""
+    kw_rid = _kw_rid_from_guid(guid)
+    if kw_rid:
+        direct = await _kw_cover_by_rid(kw_rid)
+    if not direct:
+        direct = _qq_cover_by_albummid((data or {}).get("albummid"))
+    if direct:
+        return RedirectResponse(direct, status_code=302)
+    filled = await _cross_source_cover_response(request, guid, data)
+    if filled is not None:
+        return filled
+    if CONF.get("netease_enabled"):
+        # 网易补全走 cloudsearch，单次 8s+ 预算；未启用时直接跳过（不空耗）
+        enriched = await _enrich_cover_via_netease(request, guid, data or {})
+        if enriched:
+            return RedirectResponse(enriched, status_code=302)
+    embedded = _embedded_cover_bytes(guid)
+    if embedded:
+        art, mime = embedded
+        _write_cover_cache(guid, art, mime)
+        return Response(content=art, media_type=mime,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    return None
+
+
 def _placeholder_cover_response(guid: str) -> Response:
-    """占位图池确定性选取（guid 哈希），客户端缓存 1 天。"""
+    """占位图池确定性选取（guid 哈希）。
+
+    故意不随图带缓存：同一个封面地址后续可能换成真图（封面补全/多端同步后），
+    占位图一旦缓存就会把封面钉死在灰图上，观感变成「闪一下然后再也不变」。"""
     digest = hashlib.sha256(str(guid or "").encode()).hexdigest()
     name = f"placeholder-{int(digest[:8], 16) % _PLACEHOLDER_COUNT}.png"
     content = _PLACEHOLDER_CACHE.get(name)
@@ -5508,7 +7562,7 @@ def _placeholder_cover_response(guid: str) -> Response:
     return Response(
         content=content,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
 
@@ -5518,6 +7572,7 @@ async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
+    guid = _CERU_SOURCE_OVERRIDES.get(guid, guid)
     playlist_kind = dailyrec.online_playlist_kind(guid)
     if playlist_kind:
         upstream_client = get_upstream_client(request.app)
@@ -5564,43 +7619,110 @@ async def static_cover(request: Request, subpath: str = ""):
         if cover:
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
+    ceru_pid = _ceru_playlist_id_from_guid(guid) or _ceru_playlist_id_from_guid(
+        resolve_real_guid(request.query_params.get("coverId") or subpath)
+    )
+    if ceru_pid:
+        cover = _CERU_PLAYLIST_COVERS.get(ceru_pid, "")
+        if cover:
+            return await _cached_cover_response(guid, cover)
+        return Response(status_code=404)
+    imp_pid = plimp.imp_playlist_id_from_guid(guid) or plimp.imp_playlist_id_from_guid(
+        resolve_real_guid(request.query_params.get("coverId") or subpath)
+    )
+    if imp_pid:
+        # 导入歌单封面：用导入时拿到的平台封面直链，不落音源配额
+        cover = _IMP_PLAYLIST_COVERS.get(imp_pid, "")
+        if not cover:
+            cover = str((plimp.read_record(imp_pid) or {}).get("cover") or "")
+            if cover:
+                _IMP_PLAYLIST_COVERS[imp_pid] = cover
+        if cover:
+            return await _cached_cover_response(guid, cover)
+        return Response(status_code=404)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    if _COVER_VERSION_RE.search(guid) and not _COVER_ENTITY_VERSION_RE.search(guid):
+        base_guid = _COVER_VERSION_RE.sub("", guid)
+        # 导入歌单曲目：导入时已存平台封面直链，直接命中缓存链，不打音源
+        imp_cover = _IMP_SONG_COVERS.get(base_guid, "")
+        if imp_cover:
+            return await _cached_cover_response(f"{base_guid}:imp", imp_cover)
+        # Ceru 歌曲的封面跟“当前能播的源”解耦：换源只换音频，绝不能把
+        # 播放源的封面顶上来。先用 Ceru 原封面，取不到才回退播放源封面。
+        ceru_song = ceru.song_for_guid(base_guid)
+        artwork = ceru.song_artwork(ceru_song) if ceru_song else ""
+        if not _cover_url_unusable(artwork):
+            # 独立缓存键：历史上同一 guid 已按播放源封面落过盘，直接复用
+            # 会把旧源封面吐回来（这正是列表对、正在播放错的成因）。
+            return await _cached_cover_response(f"{base_guid}:ceru", artwork)
+        # 2.6.37: 封面请求只取元数据，不顺带取词（每页 50 个封面请求的隐性放大）
+        data = await _online_info(request, base_guid, include_lyric=False)
+        cover = str((data or {}).get("cover_url") or "")
+        if not _cover_url_unusable(cover):
+            return await _cached_cover_response(base_guid, cover)
+        # 2.6.36: 播放源无封面 → 直构 CDN / 跨源搜索补齐 / 网易 / 内嵌图兜底链
+        tail = await _cover_fallback_tail(request, base_guid, data)
+        return tail if tail is not None else _placeholder_cover_response(base_guid)
+
+    if _COVER_ENTITY_VERSION_RE.search(guid):
+        base_guid = _COVER_ENTITY_VERSION_RE.sub("", guid)
+        # 2.6.37: 封面请求只取元数据，不顺带取词（每页 50 个封面请求的隐性放大）
+        data = await _online_info(request, base_guid, include_lyric=False)
+        artwork = str((data or {}).get("cover_url") or "")
+        if not artwork:
+            ceru_song = ceru.song_for_guid(base_guid)
+            artwork = ceru.song_artwork(ceru_song) if ceru_song else ""
+        if not _cover_url_unusable(artwork):
+            return await _cached_cover_response(base_guid, artwork)
+        # 2.6.36: 播放源无封面 → 统一兜底链
+        tail = await _cover_fallback_tail(request, base_guid, data)
+        return tail if tail is not None else _placeholder_cover_response(base_guid)
+
+    # 全屏播放页请求的是专辑/艺人封面（guid 以 :album / :artist 结尾）。
+    # Ceru 歌曲重建后 Fake 专辑表可能为空，这里直接回退到歌曲自身的封面。
+    if guid.endswith(":album") or guid.endswith(":artist"):
+        base_guid = guid.rsplit(":", 1)[0]
+        ceru_song = ceru.song_for_guid(base_guid)
+        artwork = ceru.song_artwork(ceru_song) if ceru_song else ""
+        if not _cover_url_unusable(artwork):
+            return await _cached_cover_response(f"{base_guid}:ceru", artwork)
+        # 2.6.37: 封面请求只取元数据，不顺带取词（每页 50 个封面请求的隐性放大）
+        data = await _online_info(request, base_guid, include_lyric=False)
+        artwork = str((data or {}).get("cover_url") or "")
+        if not _cover_url_unusable(artwork):
+            return await _cached_cover_response(base_guid, artwork)
+        # 2.6.36: 播放源无封面 → 统一兜底链
+        tail = await _cover_fallback_tail(request, base_guid, data)
+        return tail if tail is not None else _placeholder_cover_response(base_guid)
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
         cover = str((album_entry.get("item") or {}).get("cover_url") or "")
-        if cover and _KW_TEXT_COVER_HOST not in cover:
+        if not _cover_url_unusable(cover):
             return RedirectResponse(cover, status_code=302)
         return _placeholder_cover_response(guid)
 
-    data = await _online_info(request, guid)
+    # 2.6.37: 封面请求只取元数据，不顺带取词
+    data = await _online_info(request, guid, include_lyric=False)
     cover = str((data or {}).get("cover_url") or "")
+    # Ceru 歌曲：正在播放页走的是裸 guid 分支，这里同样优先 Ceru 原封面，
+    # 与列表(:cover5)/专辑(:album)分支保持一致，封面与播放源解耦。
+    if _cover_url_unusable(cover):
+        ceru_song = ceru.song_for_guid(guid)
+        artwork = ceru.song_artwork(ceru_song) if ceru_song else ""
+        if not _cover_url_unusable(artwork):
+            return await _cached_cover_response(f"{guid}:ceru", artwork)
     # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
-    if cover and _KW_TEXT_COVER_HOST not in cover:
-        return RedirectResponse(cover, status_code=302)
+    if not _cover_url_unusable(cover):
+        return await _cached_cover_response(guid, cover)
 
-    # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
-    direct = ""
-    kw_rid = _kw_rid_from_guid(guid)
-    if kw_rid:
-        direct = await _kw_cover_by_rid(kw_rid)
-    if not direct:
-        direct = _qq_cover_by_albummid((data or {}).get("albummid"))
-    if direct:
-        return RedirectResponse(direct, status_code=302)
-
-    # ③ 网易 cloudsearch 同名曲补全
-    enriched = await _enrich_cover_via_netease(request, guid, data or {})
-    if enriched:
-        return RedirectResponse(enriched, status_code=302)
-
-    # ④ 本地边听边存文件的内嵌专辑图
-    embedded = _embedded_cover_bytes(guid)
-    if embedded:
-        art, mime = embedded
-        return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+    # ② 2.6.36 统一 tail：直构 CDN → 跨源搜索补齐 → 网易补全（仅启用时）→ 内嵌图
+    tail = await _cover_fallback_tail(request, guid, data)
+    if tail is not None:
+        return tail
 
     # ⑤ 本地占位图池：在线曲目封面永不 404
     return _placeholder_cover_response(guid)
@@ -5855,6 +7977,7 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
 
 
 @app.post("/music/api/v1/favorite-track/create")
+# TOP[top.fav] 收藏创建：本地多用户隔离 + ceru 多端写回（未注册歌按主键合成）
 async def favorite_track_create(request: Request):
     upstream_client = get_upstream_client(request.app)
     try:
@@ -5906,10 +8029,54 @@ async def favorite_track_create(request: Request):
     if saved:
         _register_fav_autobind(request, guid, user_guid)
 
+    if _ceru_on():
+        ceru_song = ceru.song_for_guid(guid)
+        if ceru_song is None:
+            # 新搜索到的在线歌曲（不在同步服务器歌单里）：合成歌曲记录并登记，
+            # 收藏才能同步到桌面/安卓端，后续取消收藏也可按主键反查
+            ceru_song = _ceru_song_from_guid(guid, info)
+            if ceru_song is not None:
+                ceru.register_guid(guid, ceru_song)
+        if ceru_song:
+            try:
+                await ceru.favorite_create(ceru_song)
+            except Exception as e:
+                logger.warning("cerusync favorite create failed for %s: %s", guid, e)
+            # 标星：若该曲不在 favorites 语义歌单（刚取消过、或本机首次标星同步曲），
+            # 用 operation 加回，服务器广播给其他设备；已在歌单则跳过（服务器侧
+            # 重复 add 幂等，但先查缓存可省掉无谓的服务器写入与序号消耗）。
+            try:
+                track_key = ceru.song_track_key(ceru_song)
+                if track_key:
+                    for pid in await ceru.favorites_playlist_ids():
+                        songs = await ceru.list_playlist_songs(pid)
+                        ident = _fav_identity(ceru.song_title(ceru_song),
+                                            ceru.song_artist(ceru_song))
+                        dur = ceru.song_duration_s(ceru_song)
+                        # 同一首歌可能已经用另一个平台的主键收藏过：再 add 一次
+                        # 就是往「我的喜欢」里塞两条重复曲目
+                        already = any(
+                            isinstance(s, dict) and (
+                                ceru.song_track_key(s) == track_key
+                                or (ident
+                                    and _fav_identity(ceru.song_title(s),
+                                        ceru.song_artist(s)) == ident
+                                    and _fav_same_song(ceru.song_duration_s(s), dur))
+                            )
+                            for s in songs
+                        )
+                        if not already:
+                            await ceru.playlist_song_operation(pid, "add", track_key, song=ceru_song)
+                            ceru.invalidate_playlist_tracks(pid)
+                _forget_ceru_favorites_index()
+            except Exception as e:
+                logger.warning("cerusync star writeback failed for %s: %s", guid, e)
+
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
 @app.post("/music/api/v1/favorite-track/delete")
+# TOP[top.fav.delete] 取消收藏：主键/身份找回 → operation remove + /favorites DELETE
 async def favorite_track_delete(request: Request):
     upstream_client = get_upstream_client(request.app)
     try:
@@ -5942,6 +8109,44 @@ async def favorite_track_delete(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    if _ceru_on():
+        ceru_song = ceru.song_for_guid(guid)
+        track_key = ceru.song_track_key(ceru_song) if ceru_song else ""
+        match_info = None
+        if ceru_song is None:
+            # 注册表里没有这首歌（换源播放 / 搜到的另一平台版本 / 服务重启）：
+            # 按 guid 主键与歌名+歌手在「我的喜欢」里找回，否则取消标星没有落点
+            ceru_song, track_key = await _ceru_favorite_match(guid)
+            if ceru_song is None:
+                # 主键对不上才需要元数据：按歌名+歌手跨平台认同一首歌
+                match_info = await _best_effort_online_info(request, guid)
+                ceru_song, track_key = await _ceru_favorite_match(guid, match_info)
+            if ceru_song is None:
+                # 仍未命中：按 guid 主键合成后按键删除（operation 只在服务器
+                # 「我的喜欢」确含该曲时才真正写入；/favorites 删除未命中为 no-op）
+                ceru_song = _ceru_song_from_guid(guid, match_info)
+                track_key = ceru.song_track_key(ceru_song) if ceru_song else ""
+        if ceru_song:
+            try:
+                await ceru.favorite_delete(ceru_song)
+            except Exception as e:
+                logger.warning("cerusync favorite delete failed for %s: %s", guid, e)
+            # 取消标星：回写到 favorites 语义歌单（如“我的喜欢”）。/favorites 是
+            # 独立存储、不会联动歌单，必须走 operation 协议，服务器才会向其他设备
+            # 广播删除事件；只对缓存里确认包含该曲的歌单操作，避免无谓写入。
+            try:
+                if track_key:
+                    for pid in await ceru.favorites_playlist_ids():
+                        songs = await ceru.list_playlist_songs(pid)
+                        if any(ceru.song_track_key(s) == track_key for s in songs):
+                            await ceru.playlist_song_operation(pid, "remove", track_key)
+                            # 服务器已同步应用：立即失效本地曲目缓存，用户刷新即见最新
+                            # （不等同步事件/TTL，否则刚取消的歌刷新后还在）
+                            ceru.invalidate_playlist_tracks(pid)
+                _forget_ceru_favorites_index()
+            except Exception as e:
+                logger.warning("cerusync unstar writeback failed for %s: %s", guid, e)
+
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
@@ -5959,6 +8164,7 @@ async def favorite_track_delete(request: Request):
         ):
             _forget_bind(user_guid, guid, fav=True)
 
+    _purge_cover_cache(guid)
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
@@ -6040,17 +8246,34 @@ async def favorite_track_list(request: Request):
     # 按 createdAt 倒序
     fav_items_sorted = sorted(fav_items, key=lambda x: x.get("createdAt", 0), reverse=True)
     online_tracks = []
+    seen_guids: set[str] = set()
     for it in fav_items_sorted:
         g = str(it.get("guid") or "")
         if not g:
             continue
+        seen_guids.add(g)
         snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
         obj = build_favorite_track_obj(g, _snapshot_to_info(snapshot) if snapshot else None, created_at=it.get("createdAt"), template=template)
         obj["isFavorite"] = True
         online_tracks.append(disguise_client_json(obj))
 
+    # Ceru 同步服务器中的 song 收藏同样并入红心列表；此处构建会登记 guid→song，
+    # 用户在飞牛取消收藏时 favorite-track/delete 才能反查并回写服务器。
+    if _ceru_on():
+        try:
+            ceru_songs = await _ceru_favorite_songs()
+            for fav in ceru_songs:
+                obj = await _ceru_favorite_obj(fav, template=template)
+                if obj and str(obj.get("guid") or "") not in seen_guids:
+                    seen_guids.add(str(obj["guid"]))
+                    online_tracks.append(disguise_client_json(obj))
+        except Exception as e:
+            logger.warning("cerusync favorite list inject failed: %s", e)
+
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
+    _remember_list_order(upstream_json)
+    _warm_page_head(online_tracks)
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -6332,7 +8555,174 @@ async def _forward_official_playlist_tracks(
     return None
 
 
+# === Write-back of online songs for sync playlists / imported playlists ======================================
+# The App "add to playlist" picker can show Ceru sync playlists and imported playlists, which are not official playlists:
+# passing fake ids straight through to the official server gets them rejected, and the old logic's silent absorb
+# manifested as "tapped but nothing happened". Here we write online songs back to the sync server via the LWW
+# operation protocol (visible across desktop/Android multi-device), or append them to the local JSON of the
+# imported playlist (visible in-place within the playlist).
+
+async def _ceru_playlist_add_tracks(request: Request, playlist_guid: str, track_guids: list[str]) -> JSONResponse:
+    """Add tracks to a Ceru sync playlist: write online songs into the sync server via LWW add."""
+    if not _ceru_on():
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    pid = _ceru_playlist_id_from_guid(playlist_guid)
+    online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
+    if not online:
+        # Official guids do not belong to the sync server: keep absorbing (cannot pass through)
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    songs = await ceru.list_playlist_songs(pid)
+    is_fav = pid in await ceru.favorites_playlist_ids()
+    handled = 0
+    for g in online:
+        song = await _ceru_sync_song(request, g)
+        if not song:
+            continue
+        key = ceru.song_track_key(song)
+        if not key:
+            continue
+        # Skip if already in the playlist (including another platform primary key for the same song), avoiding duplicate entries
+        ident = _fav_identity(ceru.song_title(song), ceru.song_artist(song))
+        dur = ceru.song_duration_s(song)
+        if any(
+            isinstance(x, dict) and (
+                ceru.song_track_key(x) == key
+                or (ident
+                    and _fav_identity(ceru.song_title(x), ceru.song_artist(x)) == ident
+                    and _fav_same_song(ceru.song_duration_s(x), dur))
+            )
+            for x in songs
+        ):
+            handled += 1
+            continue
+        res = await ceru.playlist_song_operation(pid, "add", key, song=song)
+        if res is None:
+            logger.warning("cerusync playlist add failed: %s -> %s", playlist_guid, key)
+            continue
+        handled += 1
+        if is_fav:
+            try:
+                await ceru.favorite_create(song)
+            except Exception as e:
+                logger.warning("cerusync favorite create failed for %s: %s", g, e)
+    if handled:
+        ceru.invalidate_playlist_tracks(pid)
+        if is_fav:
+            _forget_ceru_favorites_index()
+    if handled:
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    return JSONResponse(content={"code": -1, "msg": "Failed to add to sync playlist, please try again later", "data": None})
+
+
+async def _ceru_playlist_remove_tracks(request: Request, playlist_guid: str, track_guids: list[str]) -> JSONResponse:
+    """Remove from a Ceru sync playlist: LWW remove, idempotent (treated as success if the song is not on the server)."""
+    if not _ceru_on():
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    pid = _ceru_playlist_id_from_guid(playlist_guid)
+    online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
+    if not online:
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    songs = await ceru.list_playlist_songs(pid)
+    present = {ceru.song_track_key(x) for x in songs if isinstance(x, dict)}
+    is_fav = pid in await ceru.favorites_playlist_ids()
+    removed = 0
+    for g in online:
+        key = next((k for k in _guid_track_keys(g) if k in present), "")
+        if not key:
+            continue
+        res = await ceru.playlist_song_operation(pid, "remove", key)
+        if res is None:
+            logger.warning("cerusync playlist remove failed: %s -> %s", playlist_guid, key)
+            continue
+        removed += 1
+        if is_fav:
+            song = next((x for x in songs if isinstance(x, dict) and ceru.song_track_key(x) == key), None)
+            if song is not None:
+                try:
+                    await ceru.favorite_delete(song)
+                except Exception as e:
+                    logger.warning("cerusync favorite delete failed for %s: %s", g, e)
+    if removed:
+        ceru.invalidate_playlist_tracks(pid)
+        if is_fav:
+            _forget_ceru_favorites_index()
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+def _imp_song_key(song: dict) -> tuple[str, str]:
+    return (str(song.get("source") or "").lower(), str(song.get("id") or ""))
+
+
+# TOP[top.imp.add] 导入歌单加歌：本地 JSON 按平台主键追加，查重幂等
+async def _imp_playlist_add_tracks(request: Request, playlist_guid: str, track_guids: list[str]) -> JSONResponse:
+    """Add tracks to an imported playlist: dedupe online songs by platform primary key, then append to the local JSON."""
+    pid = plimp.imp_playlist_id_from_guid(playlist_guid)
+    record = plimp.read_record(pid)
+    if not record:
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    existing = {_imp_song_key(x) for x in record.get("songs") or [] if isinstance(x, dict)}
+    added = 0
+    for g in (resolve_real_guid(t) for t in track_guids):
+        if not is_online_guid(g):
+            continue
+        keys = _guid_track_keys(g)
+        if not keys:
+            continue
+        platform, ident = keys[0].split(":", 1)
+        if platform == "lx" or not ident or (platform, ident) in existing:
+            continue
+        info = await _best_effort_online_info(request, g)
+        title = str(info.get("title") or "").strip()
+        if not title:
+            continue
+        song = plimp.make_song(
+            platform, ident, title,
+            str(info.get("artist") or "").strip(),
+            str(info.get("album") or info.get("albumName") or "").strip(),
+            _fav_duration_s(info.get("duration_s")),
+            str(info.get("cover_url") or "").strip(),
+        )
+        if not song:
+            continue
+        record.setdefault("songs", []).append(song)
+        existing.add((platform, ident))
+        added += 1
+    if added:
+        try:
+            plimp.write_record(record)
+        except Exception as e:
+            logger.warning("Error appending imported playlist %s: %s", pid, e)
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+async def _imp_playlist_remove_tracks(playlist_guid: str, track_guids: list[str]) -> JSONResponse:
+    """Remove from an imported playlist: delete from the local JSON by platform primary key, idempotent."""
+    pid = plimp.imp_playlist_id_from_guid(playlist_guid)
+    record = plimp.read_record(pid)
+    if not record:
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    wanted: set[tuple[str, str]] = set()
+    for g in (resolve_real_guid(t) for t in track_guids):
+        if not is_online_guid(g):
+            continue
+        for k in _guid_track_keys(g):
+            platform, _, ident = k.partition(":")
+            if platform != "lx" and ident:
+                wanted.add((platform, ident))
+    before = len(record.get("songs") or [])
+    kept = [x for x in record.get("songs") or []
+            if not (isinstance(x, dict) and _imp_song_key(x) in wanted)]
+    if len(kept) != before:
+        try:
+            record["songs"] = kept
+            plimp.write_record(record)
+        except Exception as e:
+            logger.warning("Error removing from imported playlist %s: %s", pid, e)
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
 @app.post("/music/api/v1/playlist/add-track")
+# TOP[top.playlist.write] 歌单加歌/删歌：官方透传 + 本地桶 + ceru LWW + 导入 JSON
 async def playlist_add_track(request: Request):
     """往歌单加曲目：在线条目记本地存储（幂等，重复加刷新 addedAt 对齐官方语义）。"""
     upstream_client = get_upstream_client(request.app)
@@ -6347,6 +8737,12 @@ async def playlist_add_track(request: Request):
     if nmpl.is_nm_playlist_guid(playlist_guid):
         # 网易账号歌单只读（不回写网易）：同样吸收请求
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if _is_ceru_playlist_guid(playlist_guid):
+        # Ceru 同步歌单：在线歌曲经 LWW operation 协议写回同步服务器（多端可见）
+        return await _ceru_playlist_add_tracks(request, playlist_guid, track_guids)
+    if plimp.is_imp_playlist_guid(playlist_guid):
+        # 导入歌单：在线歌曲追加进本地 JSON，歌单内原位可见
+        return await _imp_playlist_add_tracks(request, playlist_guid, track_guids)
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -6409,6 +8805,12 @@ async def playlist_remove_track(request: Request):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
     if nmpl.is_nm_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if _is_ceru_playlist_guid(playlist_guid):
+        # Ceru 同步歌单：LWW remove 写回同步服务器，幂等
+        return await _ceru_playlist_remove_tracks(request, playlist_guid, track_guids)
+    if plimp.is_imp_playlist_guid(playlist_guid):
+        # 导入歌单：按主键从本地 JSON 移除
+        return await _imp_playlist_remove_tracks(playlist_guid, track_guids)
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -6463,6 +8865,15 @@ async def playlist_delete(request: Request):
     if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
         # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+    if _is_ceru_playlist_guid(resolve_real_guid(_pl_guid)):
+        # Ceru 同步歌单只读：吸收删除
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+    imp_del = plimp.imp_playlist_id_from_guid(resolve_real_guid(_pl_guid))
+    if imp_del:
+        # 导入歌单存在本地：真删除（不透传官方，假 id 必被拒）
+        plimp.delete(imp_del)
+        _IMP_PLAYLIST_COVERS.pop(imp_del, None)
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):
         return envelope
@@ -6514,8 +8925,883 @@ def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
     }
 
 
+# === Ceru 自部署同步服务接入 ===
+
+_CERU_PLAYLIST_COVERS: dict[str, str] = {}
+_CERU_SOURCE_OVERRIDES: dict[str, str] = {}
+
+
+def _ceru_ts(value: Any) -> int:
+    """Ceru 时间戳兼容：数字直接取整，ISO 字符串转 epoch 秒。"""
+    if value is None or value == "":
+        return int(time.time())
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return int(time.time())
+
+
+def _canonical_ceru_base(guid: str) -> str:
+    """把歌曲/专辑/艺人/版本化封面 ID 收敛回原歌曲 guid。"""
+    base = str(guid or "")
+    while True:
+        for suffix in (":cover3", ":cover2", ":album:cover3", ":album:cover2", ":artist:cover3", ":artist:cover2", ":album", ":artist"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        else:
+            return base
+
+
+def _ceru_on() -> bool:
+    return bool(CONF.get("ceru_sync_enabled") and ceru.enabled())
+
+
+def _ceru_active_source() -> str:
+    if CONF.get("lx_enabled"):
+        return "lx"
+    if CONF.get("netease_enabled"):
+        return "netease"
+    if CONF.get("musicdl_enabled"):
+        return "musicdl"
+    return ""
+
+
+async def _ceru_search_fallback(keyword: str, limit: int) -> list[dict]:
+    """当前音源按标题+歌手搜索候选条目（跨源歌单的兜底映射）。"""
+    if not keyword:
+        return []
+    source = _ceru_active_source()
+    try:
+        if source == "lx":
+            return await fetch_lx_search(get_lx_client(app), keyword, limit)
+        if source == "netease":
+            return await _musicbox_search_request(get_musicbox_client(app), keyword, limit) or []
+        if source == "musicdl":
+            data = await fetch_musicdl_search(get_musicdl_client(app), keyword, limit)
+            if isinstance(data, dict):
+                return data.get("items") or []
+    except Exception as e:
+        logger.debug("cerusync search fallback failed (%s): %s", source, e)
+    return []
+
+
+def _ceru_pick_fallback(candidates: list[dict], song: dict) -> dict | None:
+    title = re.sub(r"[\s\-—·・&/、,，|]", "", ceru.song_title(song)).lower()
+    artist = re.sub(r"[\s\-—·・&/、,，|]", "", ceru.song_artist(song)).lower()
+    duration = ceru.song_duration_s(song)
+    best = None
+    best_score = -1.0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        c_title = re.sub(r"[\s\-—·・&/、,，|]", "", str(candidate.get("title") or candidate.get("name") or "")).lower()
+        c_artist = re.sub(r"[\s\-—·・&/、,，|]", "", str(candidate.get("artist") or candidate.get("singer") or "")).lower()
+        score = 0.0
+        if title and c_title:
+            if title == c_title:
+                score += 100
+            elif title in c_title or c_title in title:
+                score += 40
+        if artist and c_artist:
+            if artist == c_artist:
+                score += 50
+            elif artist in c_artist or c_artist in artist:
+                score += 20
+        try:
+            c_duration = float(candidate.get("duration_s") or 0)
+        except (TypeError, ValueError):
+            c_duration = 0.0
+        if duration > 0 and c_duration > 0:
+            delta = abs(duration - c_duration)
+            if delta <= 3:
+                score += 30
+            elif delta <= 10:
+                score += 12
+            elif delta > 30:
+                score -= 30
+        # 同平台优先，减少跨平台版本差异。
+        cand_source = str(candidate.get("lx_source") or ceru.song_source(candidate)).lower()
+        if ceru.song_source(song) == cand_source:
+            score += 5
+        # 酷狗同步源只有数字 audio_id，搜索回来的是真 hash。命中同一个
+        # audio_id 说明是同一首，给最高权重，避免同歌名不同版本被选中。
+        if ceru.song_source(song) == "kg":
+            want_sid = str(ceru.song_id(song) or "")
+            cand_audio = str(
+                candidate.get("audio_id") or candidate.get("album_audio_id") or ""
+            )
+            if want_sid and cand_audio and want_sid == cand_audio:
+                score += 200
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best if best is not None else (candidates[0] if candidates else None)
+
+
+def _ceru_item_matches_song(item: dict, song: dict) -> bool:
+    """缓存/候选必须歌名一致、歌手匹配、时长接近，避免同歌手错歌被长期缓存。"""
+    if not isinstance(item, dict):
+        return False
+    norm = lambda value: re.sub(r"[\s\-—·・&/、,，|]", "", str(value or "")).lower()
+    want_title = norm(ceru.song_title(song))
+    want_artist = norm(ceru.song_artist(song))
+    got_title = norm(item.get("title") or item.get("name"))
+    got_artist = norm(item.get("artist") or item.get("singer"))
+    if not want_title or got_title != want_title:
+        return False
+    if want_artist and got_artist and not (
+        want_artist == got_artist or want_artist in got_artist or got_artist in want_artist
+    ):
+        return False
+    want_duration = ceru.song_duration_s(song)
+    try:
+        got_duration = float(item.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        got_duration = 0.0
+    if want_duration > 0 and got_duration > 0 and abs(want_duration - got_duration) > 20:
+        return False
+    return True
+
+
+def _ceru_item_for_song(song: dict) -> dict:
+    """Ceru 歌曲 → 当前音源 item。不发起网络，先做确定性的直连映射。"""
+    source = _ceru_active_source()
+    if source == "lx":
+        return ceru.lx_item_for_song(song) or {}
+    if source == "netease" and ceru.song_source(song) == "wy":
+        sid = ceru.song_id(song)
+        if sid:
+            return {
+                "id": f"netease:{sid}",
+                "source": "netease",
+                "title": ceru.song_title(song),
+                "artist": ceru.song_artist(song),
+                "album": ceru.song_album(song),
+                "duration_s": ceru.song_duration_s(song),
+                "ext": "mp3",
+                "cover_url": ceru.song_artwork(song),
+                "lyric": "",
+            }
+    return {}
+
+
+async def _ceru_build_track(song: dict) -> dict | None:
+    """把 Ceru 歌曲转成可播放的 online VO，并登记 guid→song 反查。"""
+    if not isinstance(song, dict):
+        return None
+    item = _ceru_resolve_item_for_song(song)
+    if not item or not item.get("id"):
+        keyword = f"{ceru.song_title(song)} {ceru.song_artist(song)}".strip()
+        if not keyword:
+            return None
+        picked = _ceru_pick_fallback(await _ceru_search_fallback(keyword, 20), song)
+        item = picked if picked and _ceru_item_matches_song(picked, song) else {}
+        if item:
+            _ceru_store_lx_item(song, item)
+    if not item or not item.get("id"):
+        return None
+    try:
+        track = build_online_track(item)
+    except Exception as e:
+        logger.debug("cerusync build track failed: %s", e)
+        return None
+    guid = str(track.get("guid") or "")
+    if guid:
+        # 封面与播放解耦：VO 自带的 cover_url 一律改写为 Ceru 原封面，
+        # 播放源只提供音频，绝不允许把搜索候选的封面带进正在播放页。
+        artwork = ceru.song_artwork(song)
+        if artwork:
+            track["cover_url"] = artwork
+            track["coverUrl"] = artwork
+            track["coverURL"] = artwork
+        # 列表/ Dock / 全屏是三条不同的封面请求路径；旧占位图会被客户端
+        # 缓存 24h。这里给 Ceru 曲目的封面 ID 升一版，强制重新取真实封面。
+        shared_cover_id = f"{guid}:cover5"
+        track["coverId"] = shared_cover_id
+        album_obj = track.get("album")
+        if isinstance(album_obj, dict):
+            album_obj["coverId"] = shared_cover_id
+        ceru.register_guid(guid, song)
+    return track
+
+
+def _ceru_light_track(song: dict) -> dict | None:
+    """列表用轻量 VO：只做确定性直连映射，不发起任何网络搜索。
+
+    映射失败的歌曲用占位 item 保留在列表里（guid 仍可播：点播时
+    _open_online_stream 会按标题+歌手懒搜索解析），避免“trackCount
+    与实际列表对不上、后页全是空洞、点播放没声”。
+    """
+    if not isinstance(song, dict):
+        return None
+    item = _ceru_resolve_item_for_song(song)
+    if not item or not item.get("id"):
+        src = ceru.song_source(song) or "kg"
+        sid = ceru.song_id(song) or ""
+        if src not in ("kg", "wy", "tx", "mg", "kw"):
+            src = "kg"
+        # 占位 id：直连解析必失败，但点播时的懒搜索(fallback)可用标题找回。
+        # Ceru song_id 常藏在 raw 里(song.get('id')多为空)，用 song_track_key
+        # +标题专辑哈希做唯一键：同一首歌 guid 稳定、不同歌不串、翻页不丢。
+        raw = song.get("raw") if isinstance(song.get("raw"), dict) else {}
+        raw_key = (
+            str(song.get("id") or "").strip()
+            or str(raw.get("hash") or "").strip()
+            or str(raw.get("songmid") or "").strip()
+            or str(song.get("songmid") or "").strip()
+            or str(raw.get("rid") or raw.get("song_id") or raw.get("copyrightId") or "").strip()
+        )
+        sid_key = sid.strip() or raw_key or hashlib.md5(
+            f"{ceru.song_title(song)}|{ceru.song_artist(song)}|{ceru.song_album(song)}".encode("utf-8")
+        ).hexdigest()[:16]
+        uniq = f"{ceru.song_track_key(song)}|{sid_key}|{ceru.song_title(song)}|{ceru.song_album(song)}"
+        placeholder = "ph" + hashlib.md5(uniq.encode("utf-8")).hexdigest()[:30]
+        item = {
+            "id": f"lx:{src}:{placeholder}",
+            "source": "lx",
+            "lx_source": src,
+            "title": ceru.song_title(song),
+            "artist": ceru.song_artist(song),
+            "album": ceru.song_album(song),
+            "duration_s": ceru.song_duration_s(song),
+            "ext": "mp3",
+            "cover_url": ceru.song_artwork(song),
+            "file_size": 0,
+            "lyric": "",
+            "_ceru_placeholder": True,
+        }
+    else:
+        # 直连命中的条目也统一用 Ceru 原封面，避免播放源封面混入。
+        artwork = ceru.song_artwork(song)
+        if artwork:
+            item = dict(item)
+            item["cover_url"] = artwork
+    try:
+        track = build_online_track(item)
+    except Exception as e:
+        logger.debug("cerusync light track failed: %s", e)
+        return None
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return None
+    artwork = ceru.song_artwork(song)
+    if artwork:
+        track["cover_url"] = artwork
+        track["coverUrl"] = artwork
+        track["coverURL"] = artwork
+    shared_cover_id = f"{guid}:cover5"
+    track["coverId"] = shared_cover_id
+    album_obj = track.get("album")
+    if isinstance(album_obj, dict):
+        album_obj["coverId"] = shared_cover_id
+    ceru.register_guid(guid, song)
+    return track
+
+
+async def _ceru_favorite_obj(song: dict, template: dict | None = None) -> dict | None:
+    """Ceru song 收藏 → 收藏列表 VO（登记 guid 以便取消收藏回写）。"""
+    item = _ceru_resolve_item_for_song(song)
+    if not item or not item.get("id"):
+        keyword = f"{ceru.song_title(song)} {ceru.song_artist(song)}".strip()
+        if not keyword:
+            return None
+        picked = _ceru_pick_fallback(await _ceru_search_fallback(keyword, 20), song)
+        item = picked if picked and _ceru_item_matches_song(picked, song) else {}
+        if item:
+            _ceru_store_lx_item(song, item)
+    if not item or not item.get("id"):
+        return None
+    try:
+        track = build_online_track(item)
+    except Exception:
+        return None
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return None
+    ceru.register_guid(guid, song)
+    obj = build_favorite_track_obj(guid, item, created_at=int(time.time()), template=template)
+    # 封面与播放解耦：收藏 VO 同样用 Ceru 原封面。
+    artwork = ceru.song_artwork(song)
+    if artwork:
+        obj["cover_url"] = artwork
+        obj["coverUrl"] = artwork
+        obj["coverURL"] = artwork
+    shared_cover_id = f"{guid}:cover5"
+    obj["coverId"] = shared_cover_id
+    album_obj = obj.get("album")
+    if isinstance(album_obj, dict):
+        album_obj["coverId"] = shared_cover_id
+    return obj
+
+
+async def _ceru_cards(request: Request) -> list[dict]:
+    """Ceru 歌单摘要卡片（含“我的喜欢”），返回给 playlist/list 注入。"""
+    if not _ceru_on():
+        return []
+    logger.info("cerusync _ceru_cards called")
+    try:
+        playlists = await ceru.list_playlists()
+    except Exception as e:
+        logger.debug("cerusync playlist list failed: %s", e)
+        return []
+    cards: list[dict] = []
+    for pl in playlists:
+        pid = str(pl.get("id") or "")
+        if not pid:
+            continue
+        guid = f"online:playlist:ceru:{pid}"
+        cover = str(pl.get("coverUrl") or pl.get("cover") or "")
+        if cover:
+            _CERU_PLAYLIST_COVERS[pid] = cover
+        cover_id = "track_" + fake_official_guid(guid)
+        cards.append({
+            "guid": guid,
+            "name": str(pl.get("title") or pl.get("name") or "未命名歌单"),
+            "coverId": cover_id,
+            "createdAt": _ceru_ts(pl.get("createdAt")),
+            "updatedAt": _ceru_ts(pl.get("updatedAt")),
+            "trackCount": int(pl.get("total") or 0),
+            "isDaily": True,
+        })
+    if cards:
+        ceru.schedule_prefetch(_ceru_build_track_sync, cards)
+    logger.info("cerusync playlist list loaded: %d cards", len(cards))
+    return cards
+
+
+def _ceru_build_track_sync(song: dict) -> dict | None:
+    """schedule_prefetch 同步回调：绕过 async 上下文做一次轻量直连映射。"""
+    item = _ceru_item_for_song(song)
+    if not item or not item.get("id"):
+        return None
+    try:
+        track = build_online_track(item)
+    except Exception:
+        return None
+    guid = str(track.get("guid") or "")
+    if guid:
+        ceru.register_guid(guid, song)
+    return track
+
+
+def _ceru_playlist_id_from_guid(guid: str) -> str:
+    if not guid.startswith("online:playlist:ceru:"):
+        return ""
+    return guid[len("online:playlist:ceru:") :]
+
+
+def _is_ceru_playlist_guid(guid: str) -> bool:
+    return bool(_ceru_playlist_id_from_guid(guid or ""))
+
+
+async def _ceru_playlist_card(pid: str) -> dict | None:
+    playlists = await ceru.list_playlists()
+    for pl in playlists:
+        if str(pl.get("id") or "") == pid:
+            return {
+                "guid": f"online:playlist:ceru:{pid}",
+                "name": str(pl.get("title") or pl.get("name") or "未命名歌单"),
+                "coverId": "track_" + fake_official_guid(f"online:playlist:ceru:{pid}"),
+                "createdAt": _ceru_ts(pl.get("createdAt")),
+                "updatedAt": _ceru_ts(pl.get("updatedAt")),
+                "trackCount": int(pl.get("total") or 0),
+                "isDaily": True,
+            }
+    return None
+
+
+async def _ceru_playlist_tracks(pid: str) -> list[dict]:
+    """Ceru 歌单歌曲 → 可播 VO（按服务器顺序）。"""
+    songs = await ceru.list_playlist_songs(pid)
+    tracks: list[dict] = []
+    for song in songs:
+        track = await _ceru_build_track(song)
+        if track and track.get("guid"):
+            tracks.append(track)
+    return tracks
+
+
+async def _ceru_song_count(pid: str) -> int:
+    """歌单歌曲数（优先服务器 total，避免为计数构建全部 VO）。"""
+    playlists = await ceru.list_playlists()
+    for pl in playlists:
+        if str(pl.get("id") or "") == pid:
+            try:
+                return int(pl.get("total") or 0)
+            except (TypeError, ValueError):
+                pass
+    songs = await ceru.list_playlist_songs(pid)
+    return len(songs)
+
+
+async def _ceru_playlist_tracks_page(pid: str, start: int, size: int) -> tuple[list[dict], int]:
+    """只把当前页的歌曲构建成可播 VO，避免大歌单整单转换。"""
+    songs = await ceru.list_playlist_songs(pid)
+    total = len(songs)
+    page_songs = songs[start:start + size]
+    # 列表只做轻量直连映射，不发起搜索：未映射的用占位保留，
+    # 点播时 _open_online_stream 再懒搜索解析，避免大歌单整单搜索打爆限流。
+    tracks: list[dict] = []
+    for song in page_songs:
+        try:
+            track = _ceru_light_track(song)
+        except Exception:
+            track = None
+        if isinstance(track, dict) and track.get("guid"):
+            tracks.append(track)
+    _remember_ceru_page(tracks)
+    # 不整页预解析：洛雪用户源有硬限流，一开歌单批量请求会把后续正常播放
+    # 全部打成失败。只预热页首 1 首，用一次额度换首播接近秒开。
+    prefetch_ids = [
+        song_id_from_online_guid(str(t.get("guid") or ""))
+        for t in tracks[:1]
+        if str(t.get("guid") or "").startswith("online:lx:")
+    ]
+    if prefetch_ids:
+        schedule_lx_prefetch(prefetch_ids)
+    return tracks, total
+
+
+# ------------------------------------------------------------------ 导入歌单 ---
+# 洛雪 JSON / 酷狗·酷我·QQ·网易云·咪咕 分享链接导入的本地歌单（一单一文件）。
+# 列表阶段零上游请求：曲目只做确定性直连映射（音源 id 已知），封面用导入时
+# 存的直链，点播时才真正取链，避免一开歌单就把上游按天配额吃光。
+
+_IMP_PLAYLIST_COVERS: dict[str, str] = {}
+_IMP_SONG_COVERS: dict[str, str] = {}
+_IMP_SONG_COVER_CAP = 4000
+
+
+def _imp_cover_register(guid: str, cover: str) -> None:
+    """登记「曲目 guid → 导入时保存的封面直链」，供 /static/cover 零请求命中。"""
+    if not guid or not cover:
+        return
+    if len(_IMP_SONG_COVERS) >= _IMP_SONG_COVER_CAP:
+        _IMP_SONG_COVERS.clear()
+    _IMP_SONG_COVERS[guid] = cover
+
+
+def _imp_card_from_summary(summary: dict) -> dict:
+    guid = str(summary.get("guid") or "")
+    pid = str(summary.get("id") or "")
+    if pid:
+        _IMP_PLAYLIST_COVERS[pid] = str(summary.get("cover") or "")
+    return {
+        "guid": guid,
+        "name": str(summary.get("name") or "导入歌单"),
+        "coverId": "track_" + fake_official_guid(guid),
+        "createdAt": int(summary.get("created_at") or 0) or int(time.time()),
+        "updatedAt": int(summary.get("updated_at") or 0) or int(time.time()),
+        "trackCount": int(summary.get("count") or 0),
+        # 同热门/每日推荐/网易/Ceru：客户端只对 isDaily 的 online: 歌单拉曲目列表
+        "isDaily": True,
+    }
+
+
+def _imp_cards() -> list[dict]:
+    cards: list[dict] = []
+    for summary in plimp.list_records():
+        try:
+            cards.append(_imp_card_from_summary(summary))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("playlist import card failed: %s", e)
+    return cards
+
+
+def _imp_playlist_card(pid: str) -> dict | None:
+    record = plimp.read_record(pid)
+    if not record:
+        return None
+    return _imp_card_from_summary(plimp.summary_of(record))
+
+
+def _imp_light_track(song: dict) -> dict | None:
+    """导入歌曲 → 可播 VO（不搜索、不取链）。"""
+    if not isinstance(song, dict):
+        return None
+    try:
+        track = build_online_track(plimp.song_item(song))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("playlist import light track failed: %s", e)
+        return None
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return None
+    cover = str(song.get("cover") or "").strip()
+    if cover:
+        track["cover_url"] = cover
+        track["coverUrl"] = cover
+        track["coverURL"] = cover
+    shared_cover_id = f"{guid}:cover5"
+    track["coverId"] = shared_cover_id
+    album_obj = track.get("album")
+    if isinstance(album_obj, dict):
+        album_obj["coverId"] = shared_cover_id
+    _imp_cover_register(guid, cover)
+    return track
+
+
+def _imp_playlist_tracks_page(pid: str, start: int, size: int) -> tuple[list[dict], int]:
+    songs, total = plimp.tracks_page(pid, start, size)
+    tracks: list[dict] = []
+    for song in songs:
+        try:
+            track = _imp_light_track(song)
+        except Exception:  # noqa: BLE001
+            track = None
+        if isinstance(track, dict) and track.get("guid"):
+            tracks.append(track)
+    # 只预热页首 1 首（同 Ceru）：一次额度换首播接近秒开，其余等点播
+    prefetch_ids = [
+        song_id_from_online_guid(str(t.get("guid") or ""))
+        for t in tracks[:1]
+        if str(t.get("guid") or "").startswith("online:lx:")
+    ]
+    if prefetch_ids:
+        schedule_lx_prefetch(prefetch_ids)
+    return tracks, total
+
+
+async def _ceru_favorites_track_keys() -> set[str]:
+    """favorites 语义歌单（「我的喜欢」）全部歌曲的 trackKey 集合（走歌单缓存）。"""
+    index = await _ceru_favorites_index()
+    return set(index["keys"])
+
+
+# 「我的喜欢」存的是收藏当时那个平台的主键（tx/kw/wy/kg/mg + 平台内 id）。
+# 同一首歌换个平台播主键必然不一样，而 guid→歌曲注册表是内存态（服务重启就空），
+# 所以标星判断不能只查注册表：guid 主键推导 + 歌名歌手身份兜底都得有。
+_CERU_SOURCE_ALIASES = {
+    "netease": "wy", "musicbox": "wy", "kugou": "kg", "kuwo": "kw",
+    "qq": "tx", "tencent": "tx", "yqq": "tx", "migu": "mg",
+}
+_CERU_FAV_INDEX_TTL_S = 30.0
+# {"ts": 单调时钟, "keys": trackKey 集合, "by_key": trackKey→歌曲, "idents": 身份→歌曲列表}
+_CERU_FAV_INDEX: dict = {"ts": 0.0, "keys": set(), "by_key": {}, "idents": {}}
+_FAV_FT_SPLIT = re.compile(r"[/、,&;；+]|\bfeat(?:uring)?\.?|\bft\.?", re.IGNORECASE)
+
+
+def _fav_norm_text(text: Any) -> str:
+    """歌名/歌手归一化：去掉空白与标点符号，只留文字和数字并转小写。
+
+    跨平台的写法差异（空格、全半角括号、点号）不改变歌曲身份；而翻唱/伴奏/Live
+    这类版本后缀是文字，会保留下来，因此不会被并成同一首。"""
+    out = []
+    for ch in str(text or ""):
+        if ch.isspace() or unicodedata.category(ch)[0] in ("P", "S", "Z", "C"):
+            continue
+        out.append(ch.lower())
+    return "".join(out)
+
+
+def _fav_norm_artist(text: Any) -> str:
+    """歌手按集合比较：「A/B」与「B/A」、feat. 前后缀顺序差异算同一组。"""
+    names = {_fav_norm_text(part) for part in _FAV_FT_SPLIT.split(str(text or ""))}
+    return "|".join(sorted(name for name in names if name))
+
+
+def _fav_identity(title: Any, artist: Any) -> str:
+    song_name = _fav_norm_text(title)
+    artist_key = _fav_norm_artist(artist)
+    return f"{song_name}\u0001{artist_key}" if song_name and artist_key else ""
+
+
+def _fav_duration_s(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fav_same_song(fav_dur: float, dur: float) -> bool:
+    """时长闸门：两边都认得出时长时要差在 5s 内；有一边认不出则不因此否决。"""
+    return not fav_dur or not dur or abs(fav_dur - dur) <= 5.0
+
+
+def _identity_fields(item: Any) -> tuple[str, str, float]:
+    """任意一种曲目形态（内部 item / 客户端 track / Ceru 歌曲）都能取到身份三要素。"""
+    if not isinstance(item, dict):
+        return "", "", 0.0
+    title = str(item.get("title") or item.get("name") or "")
+    artist = str(item.get("artist") or item.get("singer") or "")
+    if not artist and isinstance(item.get("artists"), list) and item["artists"]:
+        first = item["artists"][0]
+        if isinstance(first, dict):
+            artist = str(first.get("name") or "")
+    dur = _fav_duration_s(item.get("duration_s"))
+    if dur <= 0:
+        ms = _fav_duration_s(
+            item.get("duration_ms") or item.get("durationMs") or item.get("duration")
+        )
+        dur = ms / 1000.0 if ms > 1000 else ms
+    if dur <= 0:
+        dur = ceru.song_duration_s(item)
+    return title, artist, dur
+
+
+def _merge_identity_fields(*items: Any) -> tuple[str, str, float]:
+    """按优先级合并身份字段：第一个非空值胜出。"""
+    fields = [_identity_fields(item) for item in items]
+    title = next((t for t, _a, _d in fields if t), "")
+    artist = next((a for _t, a, _d in fields if a), "")
+    duration_s = next((d for _t, _a, d in fields if d), 0.0)
+    return title, artist, duration_s
+
+
+def _guid_track_keys(guid: str) -> list[str]:
+    """在线 guid → 「我的喜欢」trackKey（{source}:{id}）候选，不依赖内存注册表。
+
+    online:lx:tx:HASH → tx:HASH（收藏里存的就是它）；同时给出原样拼接，兼容
+    source 本身就是 lx 的同步曲。netease/kugou 这类源名先翻译成洛雪平台码。"""
+    parts = [p for p in str(guid or "").split(":") if p]
+    if len(parts) < 3 or parts[0] != "online":
+        return []
+    # 只有源名大小写无关；平台内主键（QQ 的 000Opyfj4bDwYX、洛雪的 hash）大小写敏感
+    head = parts[1].lower()
+    seg = [_CERU_SOURCE_ALIASES.get(head, head)] + list(parts[2:])
+    keys = []
+    if seg[0] == "lx" and len(seg) >= 3:
+        keys.append(f"{seg[1]}:{':'.join(seg[2:])}")
+    keys.append(":".join(seg))
+    return [k for k in dict.fromkeys(keys) if k.split(":", 1)[-1].strip()]
+
+
+def _ceru_song_from_guid(guid: str, info: dict | None) -> dict | None:
+    """Online guid + track metadata -> Ceru song shape (synthesize when the song is not yet in the sync server's playlists).
+
+    After a synthesized record is written to the server, other devices will reverse-lookup
+    to a playable Luoxue item via the same primary key (lx_item_for_song), which is consistent
+    with the playback path for synced tracks. Without a song title, the entry has no meaning, so return None."""
+    keys = _guid_track_keys(guid)
+    if not keys:
+        return None
+    platform, ident = keys[0].split(":", 1)
+    if platform == "lx" or not ident:
+        return None
+    data = info if isinstance(info, dict) else {}
+    title = str(data.get("title") or "").strip()
+    if not title:
+        return None
+    artist = str(data.get("artist") or "").strip() or "Unknown Artist"
+    album = str(data.get("album") or data.get("albumName") or "").strip()
+    dur = _fav_duration_s(data.get("duration_s"))
+    if dur <= 0:
+        ms = _fav_duration_s(data.get("duration") or data.get("durationMs"))
+        dur = ms / 1000.0 if ms > 1000 else ms
+    interval = f"{int(dur) // 60:02d}:{int(dur) % 60:02d}" if dur > 0 else "00:00"
+    cover = str(data.get("cover_url") or data.get("cover") or "").strip()
+    song = {
+        "id": ident,
+        "songmid": ident,
+        "source": platform,
+        "title": title,
+        "name": title,
+        "artist": artist,
+        "singer": artist,
+        "album": album,
+        "albumName": album,
+        "interval": interval,
+        "durationText": interval,
+        "img": cover,
+        "artworkUrl": cover,
+    }
+    if platform == "kg":
+        song["hash"] = ident
+    return song
+
+
+async def _ceru_sync_song(request: Request, guid: str) -> dict | None:
+    """Song to write into the sync server: prefer a registry hit; synthesize on a miss and register it."""
+    song = ceru.song_for_guid(guid)
+    if song is None:
+        song = _ceru_song_from_guid(guid, await _best_effort_online_info(request, guid))
+        if song is not None:
+            ceru.register_guid(guid, song)
+    return song
+
+
+async def _ceru_favorites_index() -> dict:
+    """favorites 歌单索引：trackKey 集合 / trackKey→歌曲 / 身份→歌曲列表。
+
+    索引本身 30s 记忆；底下 list_playlist_songs 另有 300s 缓存并在标星写入后失效，
+    上千首歌不必每首重算一遍。"""
+    now = time.monotonic()
+    if now - float(_CERU_FAV_INDEX.get("ts") or 0.0) < _CERU_FAV_INDEX_TTL_S:
+        return _CERU_FAV_INDEX
+    keys: set[str] = set()
+    by_key: dict[str, dict] = {}
+    idents: dict[str, list[dict]] = {}
+    for song in await _ceru_favorite_songs():
+        if not isinstance(song, dict):
+            continue
+        key = ceru.song_track_key(song)
+        if key:
+            keys.add(key)
+            by_key.setdefault(key, song)
+        ident = _fav_identity(ceru.song_title(song), ceru.song_artist(song))
+        if ident:
+            idents.setdefault(ident, []).append(song)
+    # 空索引不记忆：同步服务偶发拉不到时，不能让红心集体消失 30s（底下的
+    # list_playlist_songs 自带 300s 缓存，不命中的代价只是一次内存读）
+    if keys or idents:
+        _CERU_FAV_INDEX.update({"ts": now, "keys": keys, "by_key": by_key,
+                               "idents": idents})
+    else:
+        _CERU_FAV_INDEX.update({"ts": 0.0, "keys": keys, "by_key": by_key,
+                               "idents": idents})
+    return _CERU_FAV_INDEX
+
+
+def _forget_ceru_favorites_index() -> None:
+    """标星写入后作废索引，本机立即看到最新状态。"""
+    _CERU_FAV_INDEX.update({"ts": 0.0, "keys": set(), "by_key": {}, "idents": {}})
+
+
+async def _ceru_favorite_hit(candidates: list[str], title: str, artist: str,
+                             duration_s: float) -> bool:
+    """这首歌是否已在「我的喜欢」里：先按主键，再按歌名+歌手（跨平台主键不同）。"""
+    index = await _ceru_favorites_index()
+    if any(key and key in index["keys"] for key in candidates):
+        return True
+    for song in index["idents"].get(_fav_identity(title, artist), []):
+        if _fav_same_song(ceru.song_duration_s(song), duration_s):
+            return True
+    return False
+
+
+async def _ceru_favorite_match(guid: str, info: Any = None) -> "tuple[dict | None, str]":
+    """注册表里没有这首歌时（换源播放、搜到的另一平台版本、服务重启），按 guid
+    主键与歌名+歌手在「我的喜欢」里找回对应歌曲，返回 (歌曲, trackKey)。"""
+    index = await _ceru_favorites_index()
+    for key in _guid_track_keys(guid):
+        song = index["by_key"].get(key)
+        if song is not None:
+            return song, key
+    title, artist, duration_s = _merge_identity_fields(info)
+    for song in index["idents"].get(_fav_identity(title, artist), []):
+        if _fav_same_song(ceru.song_duration_s(song), duration_s):
+            return song, ceru.song_track_key(song)
+    return None, ""
+
+
+async def _stamp_ceru_favorite_flags(tracks: list[dict], user_guid: str) -> None:
+    """补齐 ceru 歌单曲目的 isFavorite：飞牛前端按曲目该字段决定是否显示标星。
+
+    官方歌单视图同口径（本地收藏集合成员判断）；这里再并入「我的喜欢」歌单的
+    全部歌曲（收藏 tab 注入的就是它），两边观感一致。打开「我的喜欢」本身时
+    每首曲目都命中，整单默认标星。
+    判断不依赖 guid→歌曲注册表（内存态，服务重启即空）：先按 guid 推导主键，
+    再按歌名+歌手在「我的喜欢」里找，所以换源播放 / 搜到的另一平台版本也能标星。"""
+    try:
+        fav_guids = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+    except Exception:
+        fav_guids = set()
+    ceru_on = _ceru_on()
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        guid = str(track.get("guid") or "")
+        if not guid:
+            continue
+        if guid in fav_guids:
+            track["isFavorite"] = True
+            continue
+        if not ceru_on:
+            continue
+        try:
+            title, artist, duration_s = _identity_fields(track)
+            if not await _ceru_favorite_hit(_guid_track_keys(guid), title, artist, duration_s):
+                # 行上的字段不够时（歌单轻量映射只有部分元数据）再查一次注册表
+                song = ceru.song_for_guid(guid)
+                if song is None:
+                    continue
+                key = ceru.song_track_key(song)
+                alt_title, alt_artist, alt_dur = _merge_identity_fields(song, track)
+                if not await _ceru_favorite_hit(
+                        _guid_track_keys(guid) + ([key] if key else []),
+                        alt_title, alt_artist, alt_dur):
+                    continue
+            track["isFavorite"] = True
+        except Exception:
+            continue
+
+
+def _apply_ceru_metadata_fields(guid: str, song: dict, payload: dict) -> None:
+    """播放页元数据与列表行用同一封面契约（同 coverId、同原封面）。
+
+    build_metadata_payload 用裸 guid 做 coverId，列表行用 {guid}:cover5：播放页收到
+    新标识会丢弃已渲染封面重新拉取，造成「秒出来→消失→再出来」的闪动；标识与
+    URL 保持一致客户端才能直接复用。"""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    if data is None:
+        return
+    artwork = ceru.song_artwork(song)
+    cover_id = f"{guid}:cover5"
+    targets = [data]
+    for key in ("track", "album"):
+        if isinstance(data.get(key), dict):
+            targets.append(data[key])
+    for obj in targets:
+        obj["coverId"] = cover_id
+        if artwork:
+            obj["cover_url"] = artwork
+            obj["coverUrl"] = artwork
+            obj["coverURL"] = artwork
+
+
+async def _track_is_favorite(request: Request, guid: str, info: Any = None) -> bool:
+    """曲目是否标星：本地收藏 ∪「我的喜欢」（favorites 语义歌单）全部歌曲。
+
+    收藏 tab 与歌单视图都是这个口径；播放页元数据若只查本地收藏，会把列表里已
+    标星的同步曲判为未收藏，观感是「亮一下红色再取消掉」。
+    不只看 guid 字符串：「我的喜欢」存的是收藏当时那个平台的主键，同一首歌换
+    平台播（换源兜底、搜索结果里的另一平台版本）主键就变了，于是能播却不显红心。
+    现在先按 guid 推导主键，再按歌名+歌手（+时长闸门）认同一首歌。"""
+    if guid in await _online_favorite_set(request):
+        return True
+    if not _ceru_on():
+        return False
+    # 先用元数据里的身份字段试一次：命中就不必去查注册表（miss 会读盘）
+    title, artist, duration_s = _identity_fields(info)
+    if await _ceru_favorite_hit(_guid_track_keys(guid), title, artist, duration_s):
+        return True
+    song = ceru.song_for_guid(guid)
+    if song is None:
+        return False
+    key = ceru.song_track_key(song)
+    alt_title, alt_artist, alt_dur = _merge_identity_fields(song, info)
+    return await _ceru_favorite_hit(
+        _guid_track_keys(guid) + ([key] if key else []), alt_title, alt_artist, alt_dur)
+
+
+async def _ceru_favorite_songs() -> list[dict]:
+    """“我的喜欢”语义歌单的完整歌曲（用于红心列表，含歌手/专辑/时长）。"""
+    try:
+        playlists = await ceru.list_playlists()
+    except Exception:
+        return []
+    for pl in playlists:
+        title = str(pl.get("title") or pl.get("name") or "")
+        if pl.get("semanticType") == "favorites" or title in ("我的喜欢", "我的收藏"):
+            try:
+                return await ceru.list_playlist_songs(str(pl.get("id") or ""))
+            except Exception:
+                return []
+    return []
+
+
 @app.get("/music/api/v1/playlist/list")
 @app.get("/music/api/v1/playlist/list/{subpath:path}")
+# TOP[top.playlist.view] 歌单列表/曲目视图：官方歌单 + ceru/导入/推荐/网易注入
 async def playlist_list(request: Request):
     upstream_client = get_upstream_client(request.app)
     envelope = await fetch_upstream_envelope(request, upstream_client)
@@ -6532,8 +9818,16 @@ async def playlist_list(request: Request):
     kinds = _recommend_injectable_kinds(user_guid)
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
-    if not kinds and not nm_on:
-        # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
+    ceru_on = _ceru_on()
+    try:
+        imp_summaries = plimp.list_records()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("playlist import list failed: %s", e)
+        imp_summaries = []
+    logger.info("cerusync playlist_list debug: authed=%s user=%s kinds=%s nm=%s ceru=%s imp=%s",
+                is_authed, user_guid, kinds, nm_on, ceru_on, len(imp_summaries))
+    if not kinds and not nm_on and not ceru_on and not imp_summaries:
+        # 注入源全部关闭/无内容（或 shared 会话无任何可注入类型）：不注入
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -6572,19 +9866,54 @@ async def playlist_list(request: Request):
             nm_cards = []
         if nm_cards:
             nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
+    ceru_cards: list[dict] = []
+    if ceru_on:
+        try:
+            ceru_cards = await _ceru_cards(request)
+            for card in ceru_cards:
+                g = str(card.get("guid") or "")
+                if is_online_guid(g):
+                    fake_official_guid(g)
+        except Exception as e:
+            logger.warning("cerusync playlist list inject failed: %s", e)
+            ceru_cards = []
+    imp_cards: list[dict] = []
+    for summary in imp_summaries:
+        try:
+            imp_cards.append(_imp_card_from_summary(summary))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("playlist import card inject failed: %s", e)
     official = [
         it for it in official
         if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = recs + nm_cards + official
+    data["list"] = recs + nm_cards + ceru_cards + imp_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
+    data["total"] = (
+        (total if isinstance(total, int) else len(official))
+        + len(recs) + len(nm_cards) + len(ceru_cards) + len(imp_cards)
+    )
     return JSONResponse(content=envelope, headers=headers)
 
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
+    ceru_pid = _ceru_playlist_id_from_guid(guid) or _ceru_playlist_id_from_guid(resolve_real_guid(guid))
+    logger.info("cerusync detail debug: raw_guid=%s ceru_pid=%s on=%s", guid, ceru_pid, _ceru_on())
+    if ceru_pid and _ceru_on():
+        logger.info("cerusync playlist_detail guid=%s pid=%s", guid, ceru_pid)
+        card = await _ceru_playlist_card(ceru_pid)
+        if card is None:
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        card["trackCount"] = await _ceru_song_count(ceru_pid)
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+    imp_pid = plimp.imp_playlist_id_from_guid(guid) or plimp.imp_playlist_id_from_guid(resolve_real_guid(guid))
+    if imp_pid:
+        card = _imp_playlist_card(imp_pid)
+        if card is None:
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
     if nm_pl_id:
         # 网易账号歌单：只读虚拟歌单，卡片从摘要（内存→磁盘）取；trackCount 用
@@ -6635,13 +9964,25 @@ async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
+    ceru_ids = [
+        pid for pid in (
+            _ceru_playlist_id_from_guid(g) or _ceru_playlist_id_from_guid(resolve_real_guid(g))
+            for g in guids
+        ) if pid
+    ]
     nm_ids = [
         pid for pid in (
             nmpl.nm_playlist_id_from_guid(g) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(g))
             for g in guids
         ) if pid
     ]
-    if not recommend_ids and not nm_ids and not plt_dir_has_data():
+    imp_ids = [
+        pid for pid in (
+            plimp.imp_playlist_id_from_guid(g) or plimp.imp_playlist_id_from_guid(resolve_real_guid(g))
+            for g in guids
+        ) if pid
+    ]
+    if not recommend_ids and not nm_ids and not ceru_ids and not imp_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -6649,6 +9990,8 @@ async def playlist_batch_detail(request: Request):
         g for g in guids
         if not dailyrec.is_recommend_playlist_guid(g)
         and not nmpl.is_nm_playlist_guid(resolve_real_guid(g))
+        and not _is_ceru_playlist_guid(resolve_real_guid(g))
+        and not plimp.is_imp_playlist_guid(resolve_real_guid(g))
     ]
     official_list: list = []
     if rest:
@@ -6697,7 +10040,58 @@ async def playlist_batch_detail(request: Request):
             if tracks is not None:
                 card = {**card, "trackCount": len(tracks)}
             recs.append(card)
+    for pid in ceru_ids:
+        card = await _ceru_playlist_card(pid)
+        if card is not None:
+            card["trackCount"] = await _ceru_song_count(pid)
+            recs.append(card)
+    for pid in imp_ids:
+        card = _imp_playlist_card(pid)
+        if card is not None:
+            recs.append(card)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
+
+
+def _preheat_playlist_page_covers(request: Request, page_tracks: list) -> None:
+    """2.6.36 列表级封面回补：当页前 20 首里缺可用封面的曲目，后台走首播预热链。
+
+    「我的喜欢」这类歌单空封面/内网地址曲目多（实测 1388 首里 169 首空封面），
+    不等用户点播、按页后台补齐（每页最多 5 首、并发 3），客户端刷新即见真封面。
+    """
+    targets = []
+    for t in (page_tracks or [])[:20]:
+        if not isinstance(t, dict):
+            continue
+        t_guid = str(t.get("guid") or "")
+        if not is_online_guid(t_guid) or t_guid in _PREHEAT_INFLIGHT:
+            continue
+        if _read_cover_cache(t_guid):
+            continue
+        cover = str(t.get("cover_url") or t.get("coverUrl") or "")
+        if cover and not _cover_url_unusable(cover):
+            continue
+        targets.append(t_guid)
+        if len(targets) >= 3:  # 2.6.37: 每页最多 3 首，页内预热不压主路径
+            break
+    if not targets:
+        return
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(3)
+
+        async def _one(g: str) -> None:
+            async with sem:
+                try:
+                    _preheat_track_assets(request, g)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        await asyncio.gather(*(_one(g) for g in targets))
+
+    try:
+        asyncio.create_task(_run())
+    except RuntimeError:
+        pass
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -6709,6 +10103,45 @@ async def playlist_track_list(request: Request):
         or ""
     ).strip()
     kind = dailyrec.online_playlist_kind(guid)
+    ceru_pid = _ceru_playlist_id_from_guid(guid) or _ceru_playlist_id_from_guid(resolve_real_guid(guid))
+    logger.info("cerusync track_list debug: raw_guid=%s ceru_pid=%s on=%s", guid, ceru_pid, _ceru_on())
+    if ceru_pid and _ceru_on():
+        logger.info("cerusync playlist_track_list guid=%s pid=%s", guid, ceru_pid)
+        logger.info("cerusync track_list raw_query=%s", request.url.query)
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            # “播放全部/返回全部”：仍走分页轻量映射，上限 500 首，避免整单
+            # 搜索把洛雪源限流打爆导致点播放没声。
+            size = 500
+        if size < 1:
+            size = 50
+        if size > 500:
+            size = 500
+        start = (page - 1) * size
+        logger.info("cerusync track_list parsed page=%s size=%s start=%s", page, size, start)
+        page_tracks, total = await _ceru_playlist_tracks_page(ceru_pid, start, size)
+        page_tracks = dailyrec.stamp_playlist_tracks(page_tracks)
+        await _stamp_ceru_favorite_flags(page_tracks, user_guid)
+        _preheat_playlist_page_covers(request, page_tracks)
+        logger.info("cerusync track_list loaded: pid=%s total=%d page=%d", ceru_pid, total, len(page_tracks))
+        return JSONResponse(
+            content=disguise_client_json({
+                "code": 0,
+                "msg": "ok",
+                "data": {"list": page_tracks, "total": total, "sort": request.query_params.get("sort") or ""},
+            })
+        )
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
     if nm_pl_id:
         # 网易账号歌单曲目：可播过滤后的 VO 分页下发（与推荐歌单同款分页语义）
@@ -6733,11 +10166,45 @@ async def playlist_track_list(request: Request):
             size = 50
         start = (page - 1) * size
         page_tracks = tracks[start:start + size]
+        payload = {
+            "code": 0,
+            "msg": "ok",
+            "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+        }
+        _remember_list_order(payload)
+        _warm_page_head(page_tracks)
+        return JSONResponse(content=disguise_client_json(payload))
+    imp_pid = plimp.imp_playlist_id_from_guid(guid) or plimp.imp_playlist_id_from_guid(resolve_real_guid(guid))
+    if imp_pid:
+        # 导入歌单曲目：本地 JSON 分页下发，列表阶段零上游请求
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            # 「播放全部」：上限 500，与 Ceru 同口径，避免整单构建拖慢首屏
+            size = 500
+        if size < 1:
+            size = 50
+        if size > 500:
+            size = 500
+        start = (page - 1) * size
+        page_tracks, total = _imp_playlist_tracks_page(imp_pid, start, size)
+        page_tracks = dailyrec.stamp_playlist_tracks(page_tracks)
+        _preheat_playlist_page_covers(request, page_tracks)
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
                 "msg": "ok",
-                "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+                "data": {"list": page_tracks, "total": total, "sort": request.query_params.get("sort") or ""},
             })
         )
     if not kind:
@@ -6807,6 +10274,8 @@ async def playlist_track_list(request: Request):
 
         data["list"] = official_list + online_page
         data["total"] = official_total + len(online_objs)
+        _remember_list_order(envelope)
+        _warm_page_head(official_list + online_page)
         return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
@@ -6831,13 +10300,14 @@ async def playlist_track_list(request: Request):
         size = 50
     start = (page - 1) * size
     page_tracks = tracks[start:start + size]
-    return JSONResponse(
-        content=disguise_client_json({
-            "code": 0,
-            "msg": "ok",
-            "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
-        })
-    )
+    payload = {
+        "code": 0,
+        "msg": "ok",
+        "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+    }
+    _remember_list_order(payload)
+    _warm_page_head(page_tracks)
+    return JSONResponse(content=disguise_client_json(payload))
 
 
 # === album detail（在线曲目伪装专辑详情，issue #22）===
@@ -6886,7 +10356,10 @@ def _album_detail_payload(album_guid: str, album_name: str, artist: str, tracks:
         "trackCount": len(tracks),
         "tracks": dailyrec.stamp_playlist_tracks(tracks),
     }
-    return {"code": 0, "msg": "ok", "data": album_obj}
+    payload = {"code": 0, "msg": "ok", "data": album_obj}
+    _remember_list_order(payload)
+    _warm_page_head(tracks)
+    return payload
 
 
 async def _netease_album_detail_payload(request: Request, entry: dict) -> dict | None:
@@ -7529,6 +11002,18 @@ async def play_history_list(request: Request):
                     "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
+                }
+        if not (info or {}).get("title"):
+            # Ceru 歌单/收藏歌曲的标题映射是持久化的，历史快照缺字段时从这里补。
+            ceru_song = ceru.song_for_guid(guid)
+            if ceru_song:
+                info = {
+                    **(info or {}),
+                    "title": ceru.song_title(ceru_song),
+                    "artist": ceru.song_artist(ceru_song),
+                    "album": ceru.song_album(ceru_song),
+                    "duration_s": ceru.song_duration_s(ceru_song),
+                    "cover_url": (info or {}).get("cover_url") or ceru.song_artwork(ceru_song),
                 }
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = guid in fav_set

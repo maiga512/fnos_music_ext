@@ -21,6 +21,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,20 @@ exit "${STUB_RESTORE_RC:-0}"
 """
 
 
+def _real_tar() -> str | None:
+    """选支持 --ignore-failed-read 的 tar（GNU tar）；macOS 自带 bsdtar 无此
+    标志，存在 gtar（GNU tar）时回退使用，保证备份内容类测试可跑。"""
+    for name in ("tar", "gtar"):
+        path = shutil.which(name)
+        if path is None:
+            continue
+        probe = subprocess.run([path, "--ignore-failed-read", "--version"],
+                               capture_output=True)
+        if probe.returncode == 0:
+            return path
+    return shutil.which("tar")
+
+
 def _write_stub(bindir: Path, name: str, body: str) -> None:
     path = bindir / name
     # REAL_TOOLS 在此建立过符号链接，直接 write_text 会穿透写到宿主真实二进制
@@ -77,7 +92,7 @@ class Sandbox:
         self.bindir = tmp_path / "bin"
         self.bindir.mkdir()
         for tool in (*REAL_TOOLS, "bash"):
-            real = shutil.which(tool)
+            real = _real_tar() if tool == "tar" else shutil.which(tool)
             if real:
                 (self.bindir / tool).symlink_to(real)
         self.install_log = tmp_path / "logs" / "install.log"
@@ -281,14 +296,19 @@ def _socket_variant(sb: Sandbox, sock: Path) -> None:
 
 @pytest.fixture
 def held_socket(tmp_path):
-    """保持 inode 存活的临时 Unix socket（bind 后不关闭）。"""
-    path = tmp_path / "trim_music.socket"
+    """保持 inode 存活的临时 Unix socket（bind 后不关闭）。
+
+    AF_UNIX 路径受 sun_path 长度限制（macOS 为 104 字节），pytest 的 tmp_path 在
+    macOS 上常超限，改用 /tmp 下的短路径目录。"""
+    short = Path(tempfile.mkdtemp(prefix="fnm-s", dir="/tmp"))
+    path = short / "trim_music.socket"
     s = socket.socket(socket.AF_UNIX)
     s.bind(str(path))
     try:
         yield path
     finally:
         s.close()
+        shutil.rmtree(short, ignore_errors=True)
 
 
 def test_install_init_fails_without_docker(sb, tmp_path):
@@ -324,6 +344,58 @@ def test_install_init_fails_when_docker_daemon_not_running(sb, tmp_path, held_so
 
 
 # -------------------------------------------------------- install_callback ---
+
+def test_install_callback_restores_lx_pool_from_uninstall_backup(sb):
+    """卸载后重装时，最近一次备份里的洛雪附加源池必须自动恢复。"""
+    repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
+    backup_root = sb.tmp / "backup-volume"
+    backup_root.mkdir()
+    staging = sb.tmp / "backup-source"
+    (staging / "sources-data" / "lxmusic" / "sources").mkdir(parents=True)
+    (staging / "sources-data" / "lxmusic" / "sources.json").write_text(
+        '{"version":1,"sources":[]}', encoding="utf-8")
+    (staging / "sources-data" / "lxmusic" / "sources" / "src_backup.js").write_text(
+        "/* @name backup */", encoding="utf-8")
+    archive = backup_root / "fnmusic-ext-backup-20261008080000.tar.gz"
+    subprocess.run(["tar", "-czf", str(archive), "-C", str(staging), "sources-data"], check=True)
+    result = sb.run(
+        "install_callback", wizard_sources="lxmusic", FNMUSIC_BACKUP_VOLUME=str(backup_root))
+    assert result.returncode == 0, result.stderr
+    assert (repo / "sources-data" / "lxmusic" / "sources.json").is_file()
+    assert (repo / "sources-data" / "lxmusic" / "sources" / "src_backup.js").is_file()
+    assert "已从卸载备份恢复 sources-data" in (sb.pkgvar / "fnmusic-app.log").read_text(encoding="utf-8")
+
+
+def test_install_callback_restores_env_and_data_from_backup(sb):
+    """卸载后重装：.env（设置/登录态）、收藏、历史与音源池一并恢复（仅缺失项）。"""
+    repo = sb.make_repo()  # 全新安装：无 .env、无数据
+    backup_root = sb.tmp / "backup-volume"
+    backup_root.mkdir()
+    staging = sb.tmp / "backup-source"
+    (staging / "sources-data" / "lxmusic").mkdir(parents=True)
+    (staging / ".env").write_text("FNMUSIC_LX_ENABLED=true\nLX_SOURCE_URL=http://s/x.js\n", encoding="utf-8")
+    (staging / "sources-data" / "lxmusic" / "sources.json").write_text("{}", encoding="utf-8")
+    (staging / "online_favorites").mkdir()
+    (staging / "online_favorites" / "u1.json").write_text("[]", encoding="utf-8")
+    (staging / "play_history").mkdir()
+    (staging / "play_history" / "u1.json").write_text("[]", encoding="utf-8")
+    archive = backup_root / "fnmusic-ext-backup-20261008080000.tar.gz"
+    subprocess.run([
+        "tar", "-czf", str(archive), "-C", str(staging),
+        ".env", "sources-data", "online_favorites", "play_history"
+    ], check=True)
+    result = sb.run("install_callback", wizard_sources="lxmusic", FNMUSIC_BACKUP_VOLUME=str(backup_root))
+    assert result.returncode == 0, result.stderr
+    assert (repo / ".env").read_text(encoding="utf-8").startswith("FNMUSIC_LX_ENABLED=true")
+    assert (repo / "sources-data" / "lxmusic" / "sources.json").is_file()
+    assert (repo / "online_favorites" / "u1.json").is_file()
+    assert (repo / "play_history" / "u1.json").is_file()
+    log = (sb.pkgvar / "fnmusic-app.log").read_text(encoding="utf-8")
+    for item in (".env", "sources-data", "online_favorites", "play_history"):
+        assert f"已从卸载备份恢复 {item}" in log
+    # 恢复不阻塞安装主流程
+    assert sb.install_args()
+
 
 def test_install_callback_defaults_invalid_source_to_musicdl(sb):
     sb.make_repo()
@@ -688,6 +760,22 @@ def test_uninstall_init_keep_data_false_skips_archive(sb):
     result = sb.run("uninstall_init", wizard_keep_data="false")
     assert result.returncode == 0, result.stderr
     assert not sb.tar_log.exists()
+
+
+def test_uninstall_init_wipe_deletes_existing_archives(sb):
+    """清空模式：不产生新归档，并删除此前卸载产生的历史备份。"""
+    repo = sb.make_repo(with_restore=True)
+    sb.add_data(repo)
+    sb.add_tar()
+    vol = sb.tmp / "volwipe"
+    vol.mkdir()
+    old = vol / "fnmusic-ext-backup-20260101000000.tar.gz"
+    old.write_bytes(b"old-backup")
+    result = sb.run("uninstall_init", wizard_keep_data="false", FNMUSIC_BACKUP_VOLUME=str(vol))
+    assert result.returncode == 0, result.stderr
+    assert not sb.tar_log.exists()
+    assert not old.exists()
+    assert not list(vol.glob("fnmusic-ext-backup-*.tar.gz"))
 
 
 def test_uninstall_init_archives_to_volume_root(sb):
